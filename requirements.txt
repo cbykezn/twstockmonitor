@@ -5,3 +5,4 @@ plotly
 requests
 streamlit-autorefresh
 curl_cffi
+websocket-client
