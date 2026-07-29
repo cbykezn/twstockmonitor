@@ -360,18 +360,18 @@ with st.spinner('正在同步數據、計算 KD 指標與最新報價...'):
         kd_data[name] = {"K": round(df['K'].iloc[-1], 2), "D": round(df['D'].iloc[-1], 2)}
 
     # === 動態判定大盤成交量 ===
+    twse_vol, twse_msg = fetch_twse_market_turnover() # 確保證交所盤後數據優先抓取備用
     fugle_twii_vol = realtime_quotes.get("大盤", {}).get("volume")
+    
     if fugle_twii_vol and fugle_twii_vol > 0:
         final_daily_volume = round(fugle_twii_vol / 100000000.0, 2)
         vol_source = "Fugle盤中即時"
+    elif twse_vol is not None:
+        final_daily_volume = twse_vol
+        vol_source = "TWSE盤後數據"
     else:
-        twse_vol, twse_msg = fetch_twse_market_turnover()
-        if twse_vol is not None:
-            final_daily_volume = twse_vol
-            vol_source = "TWSE盤後數據"
-        else:
-            final_daily_volume = 3200.0
-            vol_source = "手動預設"
+        final_daily_volume = 3200.0
+        vol_source = "手動預設"
 
     if len(prices) == 4:
         st.sidebar.header("⚙️ 參數設定與盤中觀察")
@@ -389,7 +389,15 @@ with st.spinner('正在同步數據、計算 KD 指標與最新報價...'):
 
         # 顯示主要數據
         col1, col2, col3, col4 = st.columns(4)
+        
+        # 側邊欄：即時成交量輸入框
+        st.sidebar.markdown("---")
         daily_volume = st.sidebar.number_input(f"今日大盤成交量 ({vol_source}) 億", value=float(final_daily_volume), step=50.0, format="%.2f")
+        
+        # 🌟 新增：側邊欄官方證交所盤後數據對照
+        twse_vol_display = format_volume(twse_vol) if twse_vol else "尚未公布或抓取失敗"
+        st.sidebar.info(f"🏛️ **官方(證交所)盤後結算量**\n\n📌 **{twse_vol_display}**")
+
         vol_text = f"今日成交: {format_volume(daily_volume)}"
 
         col1.metric(f"📈 大盤指數 ({vol_text})", f"{prices['大盤']:,.2f}", f"{changes['大盤']['amount']:+.2f} 點 ({changes['大盤']['pct']:+.2f}%)", delta_color="inverse")
