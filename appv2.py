@@ -63,7 +63,7 @@ def format_volume(yi):
         return f"{yi:,.2f} 億元"
 
 # -------------------------
-# 🌟 極簡化：Fugle 查詢一律使用最純粹的台股代號字串
+# 🌟 全新 v1.0 支援：直接使用純代號
 # -------------------------
 FUGLE_SYMBOL_MAP = {
     "0052": "0052",
@@ -71,7 +71,7 @@ FUGLE_SYMBOL_MAP = {
     "00830": "00830",
 }
 
-# thread-safe store for WS
+# thread-safe store
 from threading import Lock
 _fugle_store = {"data": {}, "lock": Lock()}
 
@@ -120,23 +120,33 @@ def get_fugle_token_and_source():
 
 fugle_token, fugle_token_source, fugle_secrets_keys = get_fugle_token_and_source()
 if fugle_token:
-    pass # 靜默載入，維持版面乾淨
+    pass
 else:
     st.sidebar.error("Fugle token 未載入，請確認 secrets.toml 設定。")
 
 # -------------------------
-# Fugle WebSocket
+# 🌟 全新升級：Fugle v1.0 WebSocket
 # -------------------------
 def start_fugle_ws(symbols: List[str], token: str):
     if not WS_AVAILABLE or not token:
         return None
-    ws_url = f"wss://realtime.fugle.tw/v0/streams/quote?token={token}"
+    # 升級為 v1.0 streaming 網址
+    ws_url = "wss://api.fugle.tw/marketdata/v1.0/stock/streaming"
     
     def on_open(ws):
+        # 進行連線身份驗證 (v1.0 規範)
+        auth_msg = json.dumps({"event": "auth", "apikey": token})
+        ws.send(auth_msg)
+        time.sleep(0.5)
+        
+        # 訂閱 aggregates (最新價格) 與 trades (成交量)
         for s in symbols:
             try:
-                # 訂閱時，直接傳送純字串代號
-                sub_msg = json.dumps({"type": "subscribe", "symbol": s})
+                sub_msg = json.dumps({
+                    "event": "subscribe",
+                    "channel": "aggregates",
+                    "symbol": s
+                })
                 ws.send(sub_msg)
                 time.sleep(0.05)
             except Exception:
@@ -145,24 +155,31 @@ def start_fugle_ws(symbols: List[str], token: str):
     def on_message(ws, message):
         try:
             data = json.loads(message)
-            # 從 WS 訊息中抓出 symbol
-            sym = data.get("symbol") or data.get("s") or data.get("id")
-            if not sym: return
-            
-            sym_str = str(sym)
-            target_key = None
-            for k, v in FUGLE_SYMBOL_MAP.items():
-                if sym_str == v or sym_str.endswith(k):
-                    target_key = k
-                    break
-            
-            if target_key:
-                # 簡單抓取價格與量
-                price = data.get("lastPrice") or data.get("price") or data.get("z")
-                vol = data.get("volume") or data.get("v")
-                tm = data.get("time") or data.get("t")
-                if price:
-                    fugle_store_set(target_key, {"price": float(price), "volume": float(vol) if vol else None, "time": tm, "raw": data})
+            if data.get("event") == "data":
+                payload = data.get("data", {})
+                sym_str = str(payload.get("symbol", ""))
+                
+                target_key = None
+                for k, v in FUGLE_SYMBOL_MAP.items():
+                    if sym_str == v or sym_str.endswith(k):
+                        target_key = k
+                        break
+                
+                if target_key:
+                    # 抓取價格與時間
+                    price = payload.get("close") or payload.get("price")
+                    vol = payload.get("volume")
+                    tm = payload.get("time") or payload.get("timestamp")
+                    
+                    if price:
+                        current_data = fugle_store_get_all().get(target_key, {})
+                        new_data = {
+                            "price": float(price),
+                            "volume": float(vol) if vol else current_data.get("volume"),
+                            "time": tm,
+                            "raw": payload
+                        }
+                        fugle_store_set(target_key, new_data)
         except Exception:
             pass
 
@@ -179,55 +196,40 @@ def start_fugle_ws(symbols: List[str], token: str):
     return t
 
 # -------------------------
-# 🌟 修正：Fugle Intraday (強迫對齊純數字 symbolId)
+# 🌟 全新升級：Fugle v1.0 REST API (盤中/備援)
 # -------------------------
 def fetch_fugle_intraday(symbol: str, token: str) -> Dict[str, Any]:
     if not token:
         return {"error": "Fugle token not set"}
     
-    # 確保丟給 API 的 symbolId 永遠是純字串，且不帶任何前綴
-    clean_symbol = str(symbol).strip().replace("TW.", "")
-    
+    clean_symbol = str(symbol).strip()
     headers = {"X-API-KEY": token}
-    url = f"https://api.fugle.tw/realtime/v0.3/intraday/quote"
-    params = {"symbolId": clean_symbol}
+    
+    # 升級為 v1.0 URL，直接將 symbol 放在網址路徑中，不使用 symbolId 參數
+    url = f"https://api.fugle.tw/marketdata/v1.0/stock/intraday/quote/{clean_symbol}"
     
     try:
-        r = requests.get(url, headers=headers, params=params, timeout=8)
+        r = requests.get(url, headers=headers, timeout=8)
         if r.status_code != 200:
-            st.sidebar.error(f"Fugle fallback HTTP {r.status_code} for {clean_symbol}")
-            st.sidebar.json(r.json()) # 顯示錯誤訊息供 debug
             return {"error": f"HTTP {r.status_code}"}
         
         data = r.json()
-        container = data.get("data") or data.get("result") or data
-        if isinstance(container, dict):
-            quote = container.get("quote") or container
-            price = quote.get("lastPrice") or quote.get("last")
-            vol = quote.get("volume") or quote.get("totalVolume")
-            
-            if price:
-                return {"price": float(price), "volume": float(vol) if vol else None, "raw": data}
+        quote = data.get("data", {}) if "data" in data else data
         
-        return {"error": "Cannot parse price from response"}
+        # 新版欄位名稱可能為 closePrice / totalVolume
+        price = quote.get("closePrice") or quote.get("lastPrice") or quote.get("price")
+        vol = quote.get("totalVolume") or quote.get("total") or quote.get("volume")
+        
+        if price is not None:
+            return {"price": float(price), "volume": float(vol) if vol is not None else None, "raw": quote}
+        
+        return {"error": "Cannot parse price from v1.0 response"}
     except Exception as e:
         return {"error": str(e)}
 
 # -------------------------
-# TWSE OpenAPI and summary (kept as backup)
+# TWSE summary (kept as backup for 大盤)
 # -------------------------
-OPENAPI_STOCK_DAY_ALL_URL = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"
-
-@st.cache_data(ttl=60*60)
-def fetch_twse_openapi_stock_day_all() -> Tuple[Any, str]:
-    try:
-        headers = {'User-Agent': 'Mozilla/5.0'}
-        res = requests.get(OPENAPI_STOCK_DAY_ALL_URL, headers=headers, timeout=12)
-        res.raise_for_status()
-        return res.json(), "Success"
-    except Exception as e:
-        return {}, f"OpenAPI 連線錯誤: {e}"
-
 @st.cache_data(ttl=10)
 def fetch_twse_summary():
     try:
@@ -294,10 +296,9 @@ if not st.session_state["fugle_ws_started"]:
         symbols_to_sub = list(FUGLE_SYMBOL_MAP.values())
         start_fugle_ws(symbols_to_sub, fugle_token)
         st.session_state["fugle_ws_started"] = True
-        st.sidebar.info("🔌 Fugle WebSocket 背景連線已啟動。")
+        st.sidebar.success("🔌 Fugle v1.0 即時串流連線已啟動。")
 
 with st.spinner('正在同步數據與最新報價...'):
-    openapi_all, openapi_msg = fetch_twse_openapi_stock_day_all()
     twse_summary, summary_msg = fetch_twse_summary()
 
     fugle_snapshot = fugle_store_get_all()
@@ -308,13 +309,13 @@ with st.spinner('正在同步數據與最新報價...'):
         if entry and (entry.get("price") is not None):
             realtime_quotes[key] = {
                 "price": entry.get("price"),
-                "prev_close": entry.get("raw", {}).get("prevClose") or entry.get("raw", {}).get("y"),
+                "prev_close": entry.get("raw", {}).get("previousClose") or entry.get("raw", {}).get("y"),
                 "volume_lots": entry.get("volume"),
                 "time": entry.get("time"),
                 "raw": entry.get("raw")
             }
         else:
-            # fallback to Fugle REST intraday
+            # fallback to Fugle REST intraday v1.0
             fallback = fetch_fugle_intraday(fugle_sym, fugle_token) if fugle_token else {"error": "no token"}
             if "error" in fallback:
                 realtime_quotes[key] = {}
