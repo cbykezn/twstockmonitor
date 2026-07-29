@@ -4,3 +4,4 @@ pandas
 plotly
 requests
 beautifulsoup4
+streamlit-autorefresh
