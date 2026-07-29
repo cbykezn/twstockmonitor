@@ -10,20 +10,25 @@ st.set_page_config(page_title="台股抄底觀測站", layout="wide")
 st.title("🎯 台股五大關鍵底部觀測面板")
 st.markdown("---")
 
-# === 🌟 證交所官方 API 自動抓取大盤成交金額 ===
+# 格式化成交量顯示（大於1兆自動換算）
+def format_volume(yi):
+    if yi >= 10000:
+        zhao = yi / 10000
+        return f"{zhao:.2f} 兆元"
+    else:
+        return f"{yi:,.2f} 億元"
+
+# === 證交所官方 API 自動抓取大盤成交金額 ===
 @st.cache_data(ttl=60)
 def fetch_twse_market_turnover():
     try:
-        # 證交所官方每日大盤統計公開 API
         url = "https://www.twse.com.tw/exchangeReport/FMTQIK?response=json"
         headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
         res = requests.get(url, headers=headers, timeout=10)
         data = res.json()
         
         if data.get('stat') == 'OK':
-            # 取得最近一筆交易日的資料 (格式: [日期, 成交股數, 成交金額, 成交筆數, 發行市值, ...])
             latest_row = data['data'][-1]
-            # 證交所回傳的成交金額單位是「元」，我們將其轉為「億元」並取到小數點第二位
             raw_amount_str = latest_row[2].replace(',', '')
             turnover_yi = round(float(raw_amount_str) / 100000000.0, 2)
             return turnover_yi, "Success"
@@ -127,7 +132,7 @@ if len(prices) == 4:
     if use_auto_vol:
         if real_twse_vol is not None:
             daily_volume = calculate_estimated_volume(real_twse_vol)
-            st.sidebar.info(f"🏛️ 證交所官方實際量: **{real_twse_vol:,.2f}** 億\n⏱️ 系統計算成交量: **{daily_volume:,.2f}** 億")
+            st.sidebar.info(f"🏛️ 證交所官方實際量: **{format_volume(real_twse_vol)}**\n⏱️ 系統計算成交量: **{format_volume(daily_volume)}**")
         else:
             st.sidebar.error(f"API 讀取失敗: {api_msg}\n請改用手動輸入。")
             daily_volume = st.sidebar.number_input("手動輸入今日成交金額 (億)", value=10835.69, step=50.0, format="%.2f")
@@ -148,7 +153,7 @@ if len(prices) == 4:
     
     st.markdown("---")
     col1, col2, col3, col4 = st.columns(4)
-    vol_text = f"今日成交: {daily_volume:,.2f} 億"
+    vol_text = f"今日成交: {format_volume(daily_volume)}"
     
     col1.metric(f"📈 大盤指數 ({vol_text})", f"{prices['大盤']:,.0f}", f"{changes['大盤']['amount']:+.0f} 點 ({changes['大盤']['pct']:+.2f}%)", delta_color="inverse")
     col2.metric(f"📦 0052 (損益: {loss_52}%)", f"{prices['0052']}", f"{changes['0052']['amount']:+.2f} ({changes['0052']['pct']:+.2f}%)", delta_color="inverse")
@@ -172,7 +177,7 @@ if len(prices) == 4:
     st.markdown(f"""
     > **📊 目前量能結構狀態解析**：
     > * **第一關（大量換手）**：{'✅ 已達成（見 1.08 兆巨量）' if stage1_done else '⏳ 觀察中'}
-    > * **第二關（惜售量縮 / 窒息量）**：{'✅ 已達成' if cond2 else f'⏳ 評估中（目前成交量: {daily_volume:,.2f} 億，待後續量縮至 3500 億以下且不破底）'}
+    > * **第二關（惜售量縮 / 窒息量）**：{'✅ 已達成' if cond2 else f'⏳ 評估中（目前成交量: {format_volume(daily_volume)}，待後續量縮至 3500 億以下且不破底）'}
     > * **第三關（均線與反攻）**：{'✅ 已確認反攻' if cond5 else '⏳ 等待站回 5/10MA 或放量長紅'}
     """)
     st.markdown("---")
@@ -183,8 +188,8 @@ if len(prices) == 4:
             else: st.error(f"### 🔴 鎖定中\n**第 {title} 筆**\n\n{fail_msg}")
 
     c1, c2, c3, c4, c5 = st.columns(5)
-    render_card(c1, "1. 第一關-換手", cond1, f"巨量換手完成！\n成交: {daily_volume:,.2f}億", f"等待巨量換手確認\n大盤: {prices['大盤']:,.0f}")
-    render_card(c2, "2. 第二關-窒息", cond2, f"量縮惜售，賣壓枯竭！\n成交量: {daily_volume:,.2f}億", f"目前成交量: {daily_volume:,.2f}億\n未創新低: {'是' if stage2_no_new_low else '否'}")
+    render_card(c1, "1. 第一關-換手", cond1, f"巨量換手完成！\n成交: {format_volume(daily_volume)}", f"等待巨量換手確認\n大盤: {prices['大盤']:,.0f}")
+    render_card(c2, "2. 第二關-窒息", cond2, f"量縮惜售，賣壓枯竭！\n成交量: {format_volume(daily_volume)}", f"目前成交量: {format_volume(daily_volume)}\n未創新低: {'是' if stage2_no_new_low else '否'}")
     render_card(c3, "3. 時間折磨", cond3, f"盤整期滿，時間滿足！\n已過 {weeks_passed} 週", f"已過 {weeks_passed} 週（目標 3-4 週）")
     render_card(c4, "4. 型態確認", cond4, f"第二隻腳打底完成！\n目前型態: {candle_shape}", f"目前型態: {candle_shape}")
     render_card(c5, "5. 第三關-反攻", cond5, f"均線共振 / 放量長紅，右側反攻！", f"等待站回 5/10MA 或放量")
