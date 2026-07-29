@@ -4,46 +4,31 @@ import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import requests
-from bs4 import BeautifulSoup
 from datetime import datetime, timezone, timedelta
-import re
 
 st.set_page_config(page_title="台股抄底觀測站", layout="wide")
 st.title("🎯 台股五大關鍵底部觀測面板")
 st.markdown("---")
 
-# === 爬蟲函數 (附帶範圍保護) ===
+# === 🌟 證交所官方 API 自動抓取大盤成交金額 ===
 @st.cache_data(ttl=60)
-def fetch_twii_turnover():
+def fetch_twse_market_turnover():
     try:
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'Accept-Language': 'zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7',
-        }
-        res = requests.get('https://tw.stock.yahoo.com/quote/%5ETWII', headers=headers, timeout=10)
+        # 證交所官方每日大盤統計公開 API
+        url = "https://www.twse.com.tw/exchangeReport/FMTQIK?response=json"
+        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+        res = requests.get(url, headers=headers, timeout=10)
+        data = res.json()
         
-        if res.status_code != 200:
-            return None, f"網站阻擋 (狀態碼: {res.status_code})"
-            
-        soup = BeautifulSoup(res.text, 'html.parser')
-        elements = soup.find_all(['span', 'div', 'li'])
-        
-        for i, element in enumerate(elements):
-            text = element.get_text(strip=True)
-            if '成交金額' in text:
-                for j in range(1, 10):
-                    if i + j < len(elements):
-                        val_str = elements[i+j].get_text(strip=True)
-                        if any(char.isdigit() for char in val_str):
-                            clean_numbers = re.findall(r'[0-9]+(?:\.[0-9]+)?', val_str.replace(',', ''))
-                            if clean_numbers:
-                                try:
-                                    val = float(clean_numbers[0])
-                                    if 500 <= val <= 20000: 
-                                        return val, "Success"
-                                except ValueError:
-                                    continue
-        return None, "找不到正確的成交金額區塊"
+        if data.get('stat') == 'OK':
+            # 取得最近一筆交易日的資料 (格式: [日期, 成交股數, 成交金額, 成交筆數, 發行市值, ...])
+            latest_row = data['data'][-1]
+            # 證交所回傳的成交金額單位是「元」，我們將其轉為「億元」並取到小數點第二位
+            raw_amount_str = latest_row[2].replace(',', '')
+            turnover_yi = round(float(raw_amount_str) / 100000000.0, 2)
+            return turnover_yi, "Success"
+        else:
+            return None, "證交所 API 回傳狀態異常"
     except Exception as e:
         return None, f"連線錯誤: {str(e)}"
 
@@ -109,8 +94,8 @@ def draw_professional_chart(df, title_name):
 tickers = {"大盤": "^TWII", "0052": "0052.TW", "00830": "00830.TW", "00662": "00662.TW"}
 prices, changes, history_dfs, ma20_now, ma20_prev = {}, {}, {}, {}, {}
 
-with st.spinner('正在抓取報價與執行爬蟲中...'):
-    real_twii_vol, spider_msg = fetch_twii_turnover() 
+with st.spinner('正在同步證交所官方數據與最新報價...'):
+    real_twse_vol, api_msg = fetch_twse_market_turnover()
     
     for name, symbol in tickers.items():
         df = yf.Ticker(symbol).history(period="1y")
@@ -124,14 +109,6 @@ with st.spinner('正在抓取報價與執行爬蟲中...'):
 
 if len(prices) == 4:
     tw_df = history_dfs["大盤"]
-    
-    # 計算近 20 日成交金額均量 (這裡用 Yahoo 的成交股數換算比例，或者以當前抓取到的量為基準進行動態評估)
-    # 為了精準對應你的敘述，我們使用動態 20 日均量來作為基準門檻
-    # 假設以當前大盤歷史資料的 Volume 平均做為基準參考
-    # (註：yfinance 的 volume 是股數，但我們可以用百分比來做動態判定)
-    recent_20_vol_series = tw_df['Volume'].tail(20)
-    avg_20_vol = recent_20_vol_series.mean()
-    latest_vol = recent_20_vol_series.iloc[-1]
 
     # === 側邊欄設定 ===
     st.sidebar.header("⚙️ 參數設定與盤中觀察")
@@ -144,18 +121,18 @@ if len(prices) == 4:
     loss_662 = round(((prices["00662"] - cost_662) / cost_662) * 100, 2)
     
     st.sidebar.markdown("---")
-    st.sidebar.write("📌 **大盤成交量與動態判定**")
+    st.sidebar.write("📌 **大盤成交金額 (億)**")
     
-    use_auto_vol = st.sidebar.checkbox("自動抓取/推算今日成交量", value=True)
+    use_auto_vol = st.sidebar.checkbox("自動抓取證交所官方成交量", value=True)
     if use_auto_vol:
-        if real_twii_vol is not None:
-            daily_volume = calculate_estimated_volume(real_twii_vol)
-            st.sidebar.info(f"🕷️ 爬蟲抓取實際量: **{real_twii_vol}** 億\n⏱️ 系統推算預估量: **{daily_volume}** 億")
+        if real_twse_vol is not None:
+            daily_volume = calculate_estimated_volume(real_twse_vol)
+            st.sidebar.info(f"🏛️ 證交所官方實際量: **{real_twse_vol:,.2f}** 億\n⏱️ 系統計算成交量: **{daily_volume:,.2f}** 億")
         else:
-            st.sidebar.error(f"連線失敗: {spider_msg}\n請暫時取消打勾，改用手動輸入。")
-            daily_volume = st.sidebar.number_input("手動輸入今日成交金額 (億)", value=3200.0, step=50.0)
+            st.sidebar.error(f"API 讀取失敗: {api_msg}\n請改用手動輸入。")
+            daily_volume = st.sidebar.number_input("手動輸入今日成交金額 (億)", value=10835.69, step=50.0, format="%.2f")
     else:
-        daily_volume = st.sidebar.number_input("手動輸入今日成交金額 (億)", value=3200.0, step=50.0)
+        daily_volume = st.sidebar.number_input("手動輸入今日成交金額 (億)", value=10835.69, step=50.0, format="%.2f")
 
     st.sidebar.markdown("---")
     st.sidebar.write("📌 **底部三關卡客觀條件判定**")
@@ -171,7 +148,7 @@ if len(prices) == 4:
     
     st.markdown("---")
     col1, col2, col3, col4 = st.columns(4)
-    vol_text = f"今日成交: {real_twii_vol} 億" if real_twii_vol else "成交金額: 讀取中"
+    vol_text = f"今日成交: {daily_volume:,.2f} 億"
     
     col1.metric(f"📈 大盤指數 ({vol_text})", f"{prices['大盤']:,.0f}", f"{changes['大盤']['amount']:+.0f} 點 ({changes['大盤']['pct']:+.2f}%)", delta_color="inverse")
     col2.metric(f"📦 0052 (損益: {loss_52}%)", f"{prices['0052']}", f"{changes['0052']['amount']:+.2f} ({changes['0052']['pct']:+.2f}%)", delta_color="inverse")
@@ -182,9 +159,7 @@ if len(prices) == 4:
     # === 底部三關卡與 5 筆資金進場策略邏輯 ===
     worst_loss = min(loss_52, loss_830, loss_662)
     
-    # 動態窒息量判定：假設以 3500 億或動態比例作為參考，結合使用者側邊欄勾選
-    # 這裡將「第二關：量能窒息」定義為：成交量縮至相對低檔（例如低於 3500 億或符合惜售量縮），且不再破底
-    cond_volume_shrink = daily_volume <= 3500  # 可根據當前大盤中樞微調
+    cond_volume_shrink = daily_volume <= 3500  
     cond2 = cond_volume_shrink and stage2_no_new_low
 
     cond1 = (36000 <= prices["大盤"] <= 38000) or (worst_loss <= -15.0) or stage1_done
@@ -194,11 +169,10 @@ if len(prices) == 4:
 
     st.subheader("🎯 底部三關卡與五筆資金進場監測")
     
-    # 顯示三關卡進度提示
     st.markdown(f"""
     > **📊 目前量能結構狀態解析**：
-    > * **第一關（大量換手）**：{'✅ 已達成' if stage1_done else '⏳ 觀察中'}
-    > * **第二關（惜售量縮 / 窒息量）**：{'✅ 已達成（量縮且不破底）' if cond2 else f'⏳ 評估中（目前預估量: {daily_volume}億，需配合側邊欄確認未創新低）'}
+    > * **第一關（大量換手）**：{'✅ 已達成（見 1.08 兆巨量）' if stage1_done else '⏳ 觀察中'}
+    > * **第二關（惜售量縮 / 窒息量）**：{'✅ 已達成' if cond2 else f'⏳ 評估中（目前成交量: {daily_volume:,.2f} 億，待後續量縮至 3500 億以下且不破底）'}
     > * **第三關（均線與反攻）**：{'✅ 已確認反攻' if cond5 else '⏳ 等待站回 5/10MA 或放量長紅'}
     """)
     st.markdown("---")
@@ -209,8 +183,8 @@ if len(prices) == 4:
             else: st.error(f"### 🔴 鎖定中\n**第 {title} 筆**\n\n{fail_msg}")
 
     c1, c2, c3, c4, c5 = st.columns(5)
-    render_card(c1, "1. 第一關-換手", cond1, f"巨量換手完成！\n最深損益: {worst_loss}%", f"等待巨量換手確認\n大盤: {prices['大盤']:,.0f}")
-    render_card(c2, "2. 第二關-窒息", cond2, f"量縮惜售，賣壓枯竭！\n預估量: {daily_volume}億\n未創新低: 是", f"預估量: {daily_volume}億\n未創新低: {'是' if stage2_no_new_low else '否'}")
+    render_card(c1, "1. 第一關-換手", cond1, f"巨量換手完成！\n成交: {daily_volume:,.2f}億", f"等待巨量換手確認\n大盤: {prices['大盤']:,.0f}")
+    render_card(c2, "2. 第二關-窒息", cond2, f"量縮惜售，賣壓枯竭！\n成交量: {daily_volume:,.2f}億", f"目前成交量: {daily_volume:,.2f}億\n未創新低: {'是' if stage2_no_new_low else '否'}")
     render_card(c3, "3. 時間折磨", cond3, f"盤整期滿，時間滿足！\n已過 {weeks_passed} 週", f"已過 {weeks_passed} 週（目標 3-4 週）")
     render_card(c4, "4. 型態確認", cond4, f"第二隻腳打底完成！\n目前型態: {candle_shape}", f"目前型態: {candle_shape}")
     render_card(c5, "5. 第三關-反攻", cond5, f"均線共振 / 放量長紅，右側反攻！", f"等待站回 5/10MA 或放量")
