@@ -129,7 +129,7 @@ def fetch_twse_market_data():
             # 成交金額
             # ----------------------
 
-            if "成交統計" in title:
+            if "成交" in title and "金額" in str(table):
 
 
                 for r in rows:
@@ -175,7 +175,59 @@ def fetch_twse_market_data():
 
 
 @st.cache_data(ttl=60)
+@st.cache_data(ttl=60)
 def fetch_yahoo_intraday_volume():
+
+    try:
+
+        df = yf.download(
+            "^TWII",
+            period="1d",
+            interval="1m",
+            progress=False,
+            auto_adjust=False
+        )
+
+
+        if df.empty:
+            return None
+
+
+        # 防止 Yahoo MultiIndex 問題
+        if isinstance(df.columns, pd.MultiIndex):
+
+            volume = df["Volume"].iloc[:,0].sum()
+
+            price = df["Close"].iloc[:,0].mean()
+
+        else:
+
+            volume = df["Volume"].sum()
+
+            price = df["Close"].mean()
+
+
+
+        turnover = (
+            float(volume)
+            *
+            float(price)
+            /
+            100000000
+        )
+
+
+        return round(turnover,2)
+
+
+
+    except Exception as e:
+
+        st.warning(
+            f"Yahoo盤中成交量取得失敗: {e}"
+        )
+
+        return None
 
 
     try:
@@ -679,7 +731,7 @@ close_volume = market["turnover"]
 estimated_volume = None
 
 
-if intraday_volume:
+if intraday_volume is not None:
 
 
     estimated_volume = (
@@ -1009,10 +1061,6 @@ cond5 = (
     ma20.iloc[-1]
 
 )
-
-
-
-
 
 conditions = [
 
