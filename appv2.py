@@ -4,7 +4,17 @@ import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import requests
+import time
 from datetime import datetime, timezone, timedelta
+
+# yfinance 目前很容易被 Yahoo 判定為機器人而觸發限流（YFRateLimitError）。
+# 解法：用 curl_cffi 模擬 Chrome 瀏覽器的 TLS 指紋來建立連線 session。
+# 需要安裝: pip install curl_cffi
+try:
+    from curl_cffi import requests as cffi_requests
+    YF_SESSION = cffi_requests.Session(impersonate="chrome")
+except ImportError:
+    YF_SESSION = None  # 沒裝 curl_cffi 就退回 yfinance 預設連線方式
 
 st.set_page_config(page_title="台股抄底觀測站", layout="wide")
 st.title("🎯 台股五大關鍵底部觀測面板")
@@ -197,15 +207,44 @@ with st.spinner('正在同步證交所官方數據與最新報價...'):
     real_twse_vol, api_msg = fetch_twse_market_turnover()
     realtime_quotes, rt_msg = fetch_realtime_quotes(mis_codes)
 
-    # 歷史日線資料（用來畫圖 / 算均線），這段資料不需要每 15 秒重抓，cache 5 分鐘即可
-    @st.cache_data(ttl=300)
-    def fetch_history(symbol):
-        return yf.Ticker(symbol).history(period="1y")
+    # 歷史日線資料（用來畫圖 / 算均線）：今天的即時價已經由 MIS API 負責，
+    # 所以這裡一天抓一次就夠，快取用「日期」當 key，同一天內不管刷新幾次都不會重打 yfinance。
+    @st.cache_data(ttl=6 * 60 * 60)  # 快取 6 小時，同一天內最多重抓幾次
+    def fetch_history(symbol, cache_date):
+        last_err = None
+        for attempt in range(3):
+            try:
+                if YF_SESSION is not None:
+                    ticker = yf.Ticker(symbol, session=YF_SESSION)
+                else:
+                    ticker = yf.Ticker(symbol)
+                df = ticker.history(period="1y")
+                if not df.empty:
+                    return df
+            except Exception as e:
+                last_err = e
+            time.sleep(1.5 * (attempt + 1))  # 指數退避，降低連續觸發限流的機率
+        raise RuntimeError(f"yfinance 抓取 {symbol} 失敗（已重試3次）: {last_err}")
+
+    today_str = datetime.now(TW_TZ).strftime("%Y-%m-%d")
 
     for name, symbol in tickers.items():
-        df = fetch_history(symbol)
+        try:
+            df = fetch_history(symbol, today_str)
+        except Exception as e:
+            # 失敗時退回 session_state 裡「上一次成功抓到」的舊資料，不讓整個 App 崩潰
+            cache_key = f"last_good_history_{name}"
+            if cache_key in st.session_state:
+                df = st.session_state[cache_key]
+                st.warning(f"⚠️ {name} 歷史資料更新失敗（{e}），暫時沿用上次成功的快取資料。")
+            else:
+                st.error(f"❌ {name} 歷史資料抓取失敗，且無舊資料可用：{e}")
+                continue
+
         if df.empty:
             continue
+
+        st.session_state[f"last_good_history_{name}"] = df
         history_dfs[name] = df
 
         rt = realtime_quotes.get(name)

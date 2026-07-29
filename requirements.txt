@@ -3,5 +3,5 @@ yfinance
 pandas
 plotly
 requests
-beautifulsoup4
 streamlit-autorefresh
+curl_cffi
