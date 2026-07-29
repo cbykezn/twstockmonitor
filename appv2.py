@@ -384,7 +384,13 @@ with st.spinner('正在同步數據、計算 KD 指標與最新報價...'):
         # 側邊欄設定區
         st.sidebar.markdown("---")
         st.sidebar.write("📌 **大盤量能基準設定**")
-        avg_vol_20 = st.sidebar.number_input("大盤近 20 日均量 (億) 參考", value=4500.0, step=100.0)
+        
+        # 讓系統自動抓取前 20 天的歷史成交股數，並換算為預估的億元均量
+        auto_avg_vol_20 = round(history_dfs["大盤"]['Volume'].tail(20).mean() / 100000.0, 2)
+        
+        # 將自動算好的數字變成預設值帶入 (也保留了手動微調的彈性)
+        avg_vol_20 = st.sidebar.number_input("大盤近 20 日均量 (億) 參考", value=float(auto_avg_vol_20), step=100.0)
+        
         daily_volume = st.sidebar.number_input(f"今日大盤成交量 ({vol_source}) 億", value=float(final_daily_volume), step=50.0, format="%.2f")
         
         twse_vol_display = format_volume(twse_vol) if twse_vol else "尚未公布或抓取失敗"
