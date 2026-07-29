@@ -63,7 +63,7 @@ def format_volume(yi):
         return f"{yi:,.2f} 億元"
 
 # -------------------------
-# 🌟 Fugle 追蹤清單 (加入 IX0001 作為加權指數)
+# 🌟 Fugle 追蹤清單
 # -------------------------
 FUGLE_SYMBOL_MAP = {
     "大盤": "IX0001",
@@ -72,7 +72,6 @@ FUGLE_SYMBOL_MAP = {
     "00830": "00830",
 }
 
-# WebSocket 資料儲存區 (執行緒安全)
 from threading import Lock
 _fugle_store = {"data": {}, "lock": Lock()}
 
@@ -122,7 +121,7 @@ def get_fugle_token_and_source():
 fugle_token, fugle_token_source, fugle_secrets_keys = get_fugle_token_and_source()
 
 # -------------------------
-# Fugle v1.0 WebSocket (無限迴圈背景執行)
+# Fugle v1.0 WebSocket
 # -------------------------
 def start_fugle_ws(symbols: List[str], token: str):
     if not WS_AVAILABLE or not token:
@@ -133,7 +132,6 @@ def start_fugle_ws(symbols: List[str], token: str):
         auth_msg = json.dumps({"event": "auth", "apikey": token})
         ws.send(auth_msg)
         time.sleep(0.5)
-        
         for s in symbols:
             try:
                 sub_msg = json.dumps({
@@ -161,10 +159,8 @@ def start_fugle_ws(symbols: List[str], token: str):
                 
                 if target_key:
                     price = payload.get("close") or payload.get("price")
-                    # 指數(IX0001)抓取真實成交金額(totalAmount)，個股抓取成交張數
                     vol = payload.get("totalAmount") if target_key == "大盤" else payload.get("totalVolume")
                     tm = payload.get("time") or payload.get("timestamp")
-                    
                     if price:
                         current_data = fugle_store_get_all().get(target_key, {})
                         new_data = {
@@ -190,7 +186,7 @@ def start_fugle_ws(symbols: List[str], token: str):
     return t
 
 # -------------------------
-# Fugle v1.0 REST API (避免開盤瞬間WS沒資料的備援)
+# Fugle v1.0 REST API (盤中備援)
 # -------------------------
 def fetch_fugle_intraday(symbol: str, token: str) -> Dict[str, Any]:
     if not token:
@@ -210,13 +206,12 @@ def fetch_fugle_intraday(symbol: str, token: str) -> Dict[str, Any]:
         
         price = quote.get("closePrice") or quote.get("lastPrice") or quote.get("price")
         if clean_symbol == "IX0001":
-             vol = quote.get("totalAmount")
+             vol = quote.get("totalAmount") or quote.get("amount")
         else:
              vol = quote.get("totalVolume") or quote.get("total") or quote.get("volume")
         
         if price is not None:
             return {"price": float(price), "volume": float(vol) if vol is not None else None, "raw": quote}
-        
         return {"error": "Cannot parse price from v1.0 response"}
     except Exception as e:
         return {"error": str(e)}
@@ -231,7 +226,6 @@ def fetch_twse_market_turnover():
         headers = {'User-Agent': 'Mozilla/5.0'}
         res = requests.get(url, headers=headers, timeout=10)
         data = res.json()
-        
         if data.get('stat') == 'OK':
             latest_row = data['data'][-1]
             raw_amount_str = latest_row[2].replace(',', '')
@@ -345,14 +339,12 @@ with st.spinner('正在同步數據、計算 KD 指標與最新報價...'):
             diff_amount = df['Close'].iloc[-1] - df['Close'].iloc[-2]
             changes[name] = {"amount": diff_amount, "pct": (diff_amount / df['Close'].iloc[-2]) * 100}
 
-        # 將今日即時價格寫入歷史K線，確保當天日K與均線準確
         today = datetime.now(TW_TZ).date()
         if current_price is not None and df.index[-1].date() == today:
             df.loc[df.index[-1], "Close"] = current_price
             df.loc[df.index[-1], "High"] = max(df["High"].iloc[-1], current_price)
             df.loc[df.index[-1], "Low"] = min(df["Low"].iloc[-1], current_price)
 
-        # 計算指標
         df = compute_indicators(df)
         history_dfs[name] = df
         ma20_now[name] = round(df['20MA'].iloc[-1], 2)
@@ -360,10 +352,11 @@ with st.spinner('正在同步數據、計算 KD 指標與最新報價...'):
         kd_data[name] = {"K": round(df['K'].iloc[-1], 2), "D": round(df['D'].iloc[-1], 2)}
 
     # === 動態判定大盤成交量 ===
-    twse_vol, twse_msg = fetch_twse_market_turnover() # 確保證交所盤後數據優先抓取備用
+    twse_vol, twse_msg = fetch_twse_market_turnover()
     fugle_twii_vol = realtime_quotes.get("大盤", {}).get("volume")
     
-    if fugle_twii_vol and fugle_twii_vol > 0:
+    # Fugle 如果有抓到金額，且大於 1,000,000 (代表不是異常的空值或張數)，就換算為億
+    if fugle_twii_vol and fugle_twii_vol > 1000000:
         final_daily_volume = round(fugle_twii_vol / 100000000.0, 2)
         vol_source = "Fugle盤中即時"
     elif twse_vol is not None:
@@ -383,18 +376,17 @@ with st.spinner('正在同步數據、計算 KD 指標與最新報價...'):
         loss_830 = round(((prices["00830"] - cost_830) / cost_830) * 100, 2)
         loss_662 = round(((prices["00662"] - cost_662) / cost_662) * 100, 2)
 
-        # 繪製圖表
         st.plotly_chart(draw_professional_chart(history_dfs["大盤"], "加權指數 (大盤)"), use_container_width=True)
         st.markdown("---")
 
-        # 顯示主要數據
         col1, col2, col3, col4 = st.columns(4)
         
-        # 側邊欄：即時成交量輸入框
+        # 側邊欄設定區
         st.sidebar.markdown("---")
+        st.sidebar.write("📌 **大盤量能基準設定**")
+        avg_vol_20 = st.sidebar.number_input("大盤近 20 日均量 (億) 參考", value=4500.0, step=100.0)
         daily_volume = st.sidebar.number_input(f"今日大盤成交量 ({vol_source}) 億", value=float(final_daily_volume), step=50.0, format="%.2f")
         
-        # 🌟 新增：側邊欄官方證交所盤後數據對照
         twse_vol_display = format_volume(twse_vol) if twse_vol else "尚未公布或抓取失敗"
         st.sidebar.info(f"🏛️ **官方(證交所)盤後結算量**\n\n📌 **{twse_vol_display}**")
 
@@ -405,10 +397,8 @@ with st.spinner('正在同步數據、計算 KD 指標與最新報價...'):
         col3.metric(f"📦 00830 (損益: {loss_830}%)", f"{prices['00830']}", f"{changes['00830']['amount']:+.2f} ({changes['00830']['pct']:+.2f}%)", delta_color="inverse")
         col4.metric(f"📦 00662 (損益: {loss_662}%)", f"{prices['00662']}", f"{changes['00662']['amount']:+.2f} ({changes['00662']['pct']:+.2f}%)", delta_color="inverse")
 
-        # === 🌟 專屬 KD 技術指標面板 ===
         st.markdown("##### 📉 最新 KD 指標與交叉訊號")
         k_col1, k_col2, k_col3, k_col4 = st.columns(4)
-        
         def render_kd(col, name, kd_dict):
             k_val, d_val = kd_dict['K'], kd_dict['D']
             color = "orange" if k_val >= d_val else "mediumaquamarine"
@@ -423,33 +413,58 @@ with st.spinner('正在同步數據、計算 KD 指標與最新報價...'):
         st.caption(f"{'🔴 盤中即時更新中（以 Fugle v1.0 數據為主）' if is_market_open() else '⚪ 目前非交易時間，顯示為最後收盤資料'}")
         st.markdown("---")
 
-        # 進場條件判定
-        worst_loss = min(loss_52, loss_830, loss_662)
-        cond_volume_shrink = daily_volume <= 3500
-        stage1_done = st.sidebar.checkbox("✅ 第一關：已完成巨量換手 (如見1兆以上)", value=True)
-        stage2_no_new_low = st.sidebar.checkbox("⏳ 第二關條件A：指數近期沒有再創新低", value=False)
-        stage3_breakout = st.sidebar.checkbox("⏳ 第三關：已站回 5/10MA 或放量長紅", value=False)
-        weeks_passed = st.sidebar.slider("距離起跌已過幾週？", 0, 8, 0)
+        # === 🎯 五筆資金進場策略邏輯 (嚴格依照定義重構) ===
+        st.sidebar.markdown("---")
+        st.sidebar.write("📌 **主觀型態與防守判定**")
+        stage2_no_new_low = st.sidebar.checkbox("✅ 指數近期沒有再創新低", value=False)
+        break_39384 = st.sidebar.checkbox("⚠️ 大盤是否已跌破 39,384 點？", value=False)
         candle_shape = st.sidebar.selectbox("今日大盤 K 線型態", ["實體黑K", "實體紅K", "長下影線", "W底成型", "放量長紅"])
+        weeks_passed = st.sidebar.slider("距離 7/29 已過幾週？", 0, 8, 0)
 
+        # 條件 1：大盤跌到 36k-38k，或 00830/00662 其中之一未實現損益率 <= -15%
+        cond1 = (36000 <= prices["大盤"] <= 38000) or (loss_830 <= -15.0) or (loss_662 <= -15.0)
+        
+        # 條件 2：成交量 <= 3500億 或 低於近20日均量的70%，且沒有再創新低
+        cond_volume_shrink = (daily_volume <= 3500) or (daily_volume <= avg_vol_20 * 0.7)
         cond2 = cond_volume_shrink and stage2_no_new_low
-        cond1 = (36000 <= prices["大盤"] <= 38000) or (worst_loss <= -15.0) or stage1_done
-        cond3 = (3 <= weeks_passed <= 4)
-        cond4 = (prices["大盤"] <= 41000) and (candle_shape in ["長下影線", "W底成型", "放量長紅"])
-        cond5 = (all(prices[name] > ma20_now[name] for name in tickers) and all(ma20_now[name] > ma20_prev[name] for name in tickers)) or stage3_breakout
+        
+        # 條件 3：經過 3-4 週，且沒有跌破 39384 點
+        cond3 = (3 <= weeks_passed <= 4) and not break_39384
+        
+        # 條件 4：測試前低 (例如 <= 41000) 且拉出長下影線或W底
+        cond4 = (prices["大盤"] <= 41000) and (candle_shape in ["長下影線", "W底成型"])
+        
+        # 條件 5：大盤、00830、00662 皆站上 20MA，且 20MA 皆轉為上揚
+        check_list = ["大盤", "00830", "00662"]
+        cond5 = all(prices[n] > ma20_now[n] for n in check_list) and all(ma20_now[n] > ma20_prev[n] for n in check_list)
 
-        st.subheader("🎯 底部三關卡與五筆資金進場監測")
+        st.subheader("🎯 五筆資金進場監測")
         def render_card(col, title, condition, success_msg, fail_msg):
             with col:
                 if condition: st.success(f"### 🟢 第 {title} 筆\n\n{success_msg}")
                 else: st.error(f"### 🔴 鎖定中\n**第 {title} 筆**\n\n{fail_msg}")
 
         c1, c2, c3, c4, c5 = st.columns(5)
-        render_card(c1, "1. 第一關-換手", cond1, f"巨量換手完成！\n成交: {format_volume(daily_volume)}", f"等待巨量換手確認\n大盤: {prices['大盤']:,.0f}")
-        render_card(c2, "2. 第二關-窒息", cond2, f"量縮惜售，賣壓枯竭！\n成交量: {format_volume(daily_volume)}", f"目前成交量: {format_volume(daily_volume)}\n未創新低: {'是' if stage2_no_new_low else '否'}")
-        render_card(c3, "3. 時間折磨", cond3, f"盤整期滿，時間滿足！\n已過 {weeks_passed} 週", f"已過 {weeks_passed} 週（目標 3-4 週）")
-        render_card(c4, "4. 型態確認", cond4, f"第二隻腳打底完成！\n目前型態: {candle_shape}", f"目前型態: {candle_shape}")
-        render_card(c5, "5. 第三關-反攻", cond5, f"均線共振 / 放量長紅，右側反攻！", f"等待站回 5/10MA 或放量")
+        
+        render_card(c1, "1. 空間的極致", cond1, 
+                    f"已達防禦區間！\n大盤: {prices['大盤']:,.0f}\n00830 損益: {loss_830}%\n00662 損益: {loss_662}%", 
+                    f"未達防禦深度\n大盤: {prices['大盤']:,.0f}\n最深損益尚未達 -15%")
+                    
+        render_card(c2, "2. 量能的窒息", cond2, 
+                    f"賣壓枯竭，籌碼乾淨！\n成交量: {format_volume(daily_volume)}\n未創新低: 是", 
+                    f"量縮或型態未滿足\n成交量: {format_volume(daily_volume)}\n未創新低: {'是' if stage2_no_new_low else '否'}")
+                    
+        render_card(c3, "3. 時間的折磨", cond3, 
+                    f"底部承接力道確認！\n已過 {weeks_passed} 週\n破 39384: 否", 
+                    f"時間未到或破底\n已過 {weeks_passed} 週\n破 39384: {'是' if break_39384 else '否'}")
+                    
+        render_card(c4, "4. 型態的確認", cond4, 
+                    f"第二隻腳打底完成！\n目前型態: {candle_shape}", 
+                    f"打底型態尚未確認\n目前型態: {candle_shape}")
+                    
+        render_card(c5, "5. 趨勢的反轉", cond5, 
+                    f"消化完成，多頭啟動！\n三者站上且月線上揚", 
+                    f"右側趨勢尚未確認\n均線未全面站上或上揚")
 
         st.markdown("---")
         triggered_count = sum([cond1, cond2, cond3, cond4, cond5])
