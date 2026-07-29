@@ -165,11 +165,10 @@ def analyze_kline_with_gemini(df_recent_json: str, api_key: str, date_str: str) 
         return f"❌ AI 設定發生錯誤：{str(e)}"
 
 # -------------------------
-# 官方證交所 API 區 (確保指數與成交量絕對正確)
+# 官方證交所 API 區
 # -------------------------
 @st.cache_data(ttl=10)
 def fetch_twse_summary():
-    """ 抓取證交所官方即時大盤摘要 (最正確的指數與漲跌) """
     try:
         headers = {'User-Agent': 'Mozilla/5.0'}
         ts = int(datetime.now().timestamp() * 1000)
@@ -220,9 +219,6 @@ def fetch_twse_historical_turnover_20d():
     except Exception as e:
         return 4500.0, f"Error: {e}"
 
-# -------------------------
-# Fugle v1.0 REST API (個股報價主戰場)
-# -------------------------
 def fetch_fugle_intraday(symbol: str, token: str) -> Dict[str, Any]:
     if not token: return {"error": "No token"}
     clean_symbol = str(symbol).strip()
@@ -231,7 +227,6 @@ def fetch_fugle_intraday(symbol: str, token: str) -> Dict[str, Any]:
         r = requests.get(url, headers={"X-API-KEY": token}, timeout=8)
         if r.status_code != 200: return {"error": f"HTTP {r.status_code}"}
         quote = r.json().get("data", r.json())
-        # 同時抓取 closePrice, lastPrice, previousClose 避免抓空
         price = quote.get("closePrice") or quote.get("lastPrice") or quote.get("price") or quote.get("previousClose")
         vol = quote.get("totalAmount") if clean_symbol == "IX0001" else (quote.get("totalVolume") or quote.get("volume"))
         if price is not None:
@@ -288,7 +283,7 @@ with st.spinner('正在同步證交所官方數據、計算指標與 AI 解析..
 
     realtime_quotes = {}
     for key, fugle_sym in FUGLE_SYMBOL_MAP.items():
-        if key == "大盤": continue # 大盤優先使用證交所 summary
+        if key == "大盤": continue
         fallback = fetch_fugle_intraday(fugle_sym, fugle_token) if fugle_token else {"error": "no token"}
         if "error" not in fallback and fallback.get("price") is not None:
             realtime_quotes[key] = {"price": fallback.get("price"), "volume": fallback.get("volume")}
@@ -308,13 +303,15 @@ with st.spinner('正在同步證交所官方數據、計算指標與 AI 解析..
         except Exception:
             continue
 
-        today_date = datetime.now(TW_TZ).date()
+        # 🌟 確保 yfinance 數據有足夠長度
         if len(df) >= 2:
-            yf_prev_close = df['Close'].iloc[-2]
+            yf_close = float(df['Close'].iloc[-1])
+            yf_prev_close = float(df['Close'].iloc[-2])
         else:
-            yf_prev_close = df['Close'].iloc[-1]
+            yf_close = float(df['Close'].iloc[-1]) if len(df) > 0 else 0.0
+            yf_prev_close = yf_close
 
-        # === 價格指派 (大盤優先用證交所官方，個股優先用 Fugle，yfinance 作為最終防線) ===
+        # === 價格指派 (大盤用官方摘要，個股強制使用 yfinance 收盤價作為最穩健防線) ===
         if name == "大盤" and twse_summary.get("index") is not None:
             current_price = twse_summary["index"]
             diff_amount = twse_summary["diff"]
@@ -322,23 +319,12 @@ with st.spinner('正在同步證交所官方數據、計算指標與 AI 解析..
             prices[name] = round(current_price, 2)
             changes[name] = {"amount": diff_amount, "pct": pct}
         else:
-            rt_price = realtime_quotes.get(name, {}).get("price")
-            if rt_price is not None:
-                current_price = rt_price
-                prices[name] = round(current_price, 2)
-                diff_amount = current_price - yf_prev_close
-                changes[name] = {"amount": diff_amount, "pct": (diff_amount / yf_prev_close) * 100}
-            else:
-                current_price = df['Close'].iloc[-1]
-                prices[name] = round(current_price, 2)
-                diff_amount = current_price - yf_prev_close
-                changes[name] = {"amount": diff_amount, "pct": (diff_amount / yf_prev_close) * 100}
-
-        # 更新今日 K 棒
-        if current_price is not None and df.index[-1].date() == today_date and is_market_open():
-            df.loc[df.index[-1], "Close"] = current_price
-            df.loc[df.index[-1], "High"] = max(df["High"].iloc[-1], current_price)
-            df.loc[df.index[-1], "Low"] = min(df["Low"].iloc[-1], current_price)
+            # 個股強制以 yfinance 的最新收盤價為主，確保絕對不會 nan
+            current_price = yf_close
+            prices[name] = round(current_price, 2)
+            diff_amount = current_price - yf_prev_close
+            pct_val = (diff_amount / yf_prev_close) * 100 if yf_prev_close > 0 else 0.0
+            changes[name] = {"amount": round(diff_amount, 2), "pct": round(pct_val, 2)}
 
         df = compute_indicators(df)
         history_dfs[name] = df
@@ -363,7 +349,7 @@ with st.spinner('正在同步證交所官方數據、計算指標與 AI 解析..
         # 繪製圖表
         st.plotly_chart(draw_professional_chart(history_dfs["大盤"], "加權指數 (大盤)"), use_container_width=True)
         
-        # 🤖 觸發 Gemini AI 盤後解析 (盤中封印 / 盤後解鎖)
+        # 🤖 觸發 Gemini AI 盤後解析
         st.markdown("##### 🤖 Gemini 雙子星 AI 盤後解析")
         if GENAI_AVAILABLE and gemini_api_key:
             if is_market_open():
