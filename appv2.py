@@ -5,14 +5,14 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import requests
 from bs4 import BeautifulSoup
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 import re
 
 st.set_page_config(page_title="台股抄底觀測站", layout="wide")
 st.title("🎯 台股五大關鍵底部觀測面板")
 st.markdown("---")
 
-# === 🌟 終極防護版：Yahoo 股市成交量爬蟲函數 ===
+# === 🌟 修正時區與爬蟲防呆版 ===
 @st.cache_data(ttl=60)
 def fetch_twii_turnover():
     try:
@@ -20,48 +20,52 @@ def fetch_twii_turnover():
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
             'Accept-Language': 'zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7',
         }
-        # 使用安全的 URL 編碼 %5E 來代替 ^ 符號，避免產生 404 錯誤
         res = requests.get('https://tw.stock.yahoo.com/quote/%5ETWII', headers=headers, timeout=10)
         
-        if res.status_code == 404:
-             return None, "404找不到網頁 (網址已失效)"
-        elif res.status_code != 200:
+        if res.status_code != 200:
             return None, f"網站阻擋 (狀態碼: {res.status_code})"
             
         soup = BeautifulSoup(res.text, 'html.parser')
-        
-        # 暴力掃描法：直接掃描網頁所有文字，尋找「成交金額」
         elements = soup.find_all(['span', 'div', 'li'])
+        
         for i, element in enumerate(elements):
             text = element.get_text(strip=True)
             if '成交金額' in text:
-                # 往後找 10 個標籤內的第一個數字
-                for j in range(1, 11):
+                for j in range(1, 10):
                     if i + j < len(elements):
                         val_str = elements[i+j].get_text(strip=True)
-                        # 確保裡面有數字
                         if any(char.isdigit() for char in val_str):
-                            # 使用正則表達式，只提取數字與小數點 (自動過濾掉 '億'、',' 等符號)
+                            # 過濾並確保抓到的數字是大於 100 億的合理台股大盤成交量，排除小數干擾
                             clean_numbers = re.findall(r'[0-9]+(?:\.[0-9]+)?', val_str.replace(',', ''))
                             if clean_numbers:
                                 try:
-                                    return float(clean_numbers[0]), "Success"
+                                    val = float(clean_numbers[0])
+                                    # 台股成交量不可能只有個位數，若小於 100 絕對是抓錯欄位
+                                    if val > 100: 
+                                        return val, "Success"
                                 except ValueError:
                                     continue
-        return None, "找不到成交金額區塊 (Yahoo 網頁版型已更改)"
+        return None, "找不到正確的成交金額數字"
     except Exception as e:
         return None, f"連線錯誤: {str(e)}"
 
-# 自動推算預估量
+# 自動推算預估量 (強制校準為台灣時間 UTC+8)
 def calculate_estimated_volume(current_vol):
-    now = datetime.now()
-    market_start = now.replace(hour=9, minute=0, second=0, microsecond=0)
-    market_end = now.replace(hour=13, minute=30, second=0, microsecond=0)
+    tw_timezone = timezone(timedelta(hours=8))
+    now = datetime.now(tw_timezone)
+    current_time = now.time()
     
-    if now < market_start or now > market_end:
+    market_start = datetime.strptime("09:00:00", "%H:%M:%S").time()
+    market_end = datetime.strptime("13:30:00", "%H:%M:%S").time()
+    
+    # 如果是盤前或盤後（超過下午 13:30），直接回傳抓到的實際量，絕不放大
+    if current_time < market_start or current_time > market_end:
         return current_vol
     else:
-        elapsed_minutes = (now - market_start).total_seconds() / 60
+        # 僅在真正的台股盤中時間才進行時間比例放大
+        market_start_dt = datetime.combine(now.date(), market_start)
+        now_dt = datetime.combine(now.date(), current_time)
+        elapsed_minutes = (now_dt - market_start_dt).total_seconds() / 60
         if elapsed_minutes > 0:
             est_vol = current_vol * (270.0 / elapsed_minutes)
             return round(est_vol, 2)
@@ -182,7 +186,7 @@ if len(prices) == 4:
 
     c1, c2, c3, c4, c5 = st.columns(5)
     render_card(c1, "1. 空間極致", cond1, f"已達極端防禦位！\n最深損益: {worst_loss}%", f"未達恐慌區間\n大盤: {prices['大盤']:,.0f}\n最深損益: {worst_loss}%")
-    render_card(c2, "2. 量能窒息", cond2, f"量縮見底，賣壓枯竭！\n系統計算預估量: {daily_volume}億\n跌破 39384: {'是' if break_39384 else '否'}", f"預估量: {daily_volume}億\n跌破 39384: {'是' if break_39384 else '否'}")
+    render_card(c2, "2. 量能窒息", cond2, f"量縮見底，賣壓枯竭！\n系統計算預估量: {daily_volume}億\n跌破 39384: {'is' if break_39384 else '否'}", f"預估量: {daily_volume}億\n跌破 39384: {'是' if break_39384 else '否'}")
     render_card(c3, "3. 時間折磨", cond3, f"盤整期滿，底部確認！\n已過 {weeks_passed} 週\n破防守線: {'是' if break_39384 else '否'}", f"已過 {weeks_passed} 週\n破防守線: {'是' if break_39384 else '否'}")
     render_card(c4, "4. 型態確認", cond4, f"第二隻腳打底完成！\n目前型態: {candle_shape}\n指數: {prices['大盤']:,.0f}", f"目前型態: {candle_shape}\n指數: {prices['大盤']:,.0f}")
     render_card(c5, "5. 趨勢反轉", cond5, f"均線共振，右側趨勢啟動！\n站上且均線上揚", f"尚未全面站回或均線下彎")
