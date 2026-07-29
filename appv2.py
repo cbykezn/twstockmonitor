@@ -346,40 +346,18 @@ with st.spinner('正在同步數據、計算指標與 AI 解析...'):
 
         current_price = realtime_quotes.get(name, {}).get("price")
         
-          current_price = realtime_quotes.get(name, {}).get("price")
-
-        # 更穩健的「昨日收盤」與漲跌計算
-        today_date = datetime.now(TW_TZ).date()
-
-        # 嘗試取得最後一個「交易日 < 今日」的收盤作為昨日收盤（優先）
-        try:
-            prev_close_candidates = df[df.index.date < today_date]['Close']
-            if not prev_close_candidates.empty:
-                yf_prev_close = float(prev_close_candidates.iloc[-1])
-            else:
-                # 若沒有更早的交易日（例如資料只包含今天），退回到最後一筆
-                yf_prev_close = float(df['Close'].iloc[-1])
-        except Exception:
-            # 保險 fallback：如果發生任何錯誤，使用最後一筆
-            yf_prev_close = float(df['Close'].iloc[-1])
-
-        # 如果沒有即時價，就用 yfinance 的最後收盤作為 current_price
-        if current_price is None:
-            current_price = float(df['Close'].iloc[-1])
-
-        # 寫入價格
-        prices[name] = round(float(current_price), 2)
-
-        # 計算差額與百分比（避免除以零）
-        diff_amount = float(current_price) - float(yf_prev_close)
-        pct = 0.0
-        try:
-            if float(yf_prev_close) != 0:
-                pct = (diff_amount / float(yf_prev_close)) * 100
-        except Exception:
-            pct = 0.0
-
-        changes[name] = {"amount": diff_amount, "pct": pct}
+        if current_price is not None:
+            prices[name] = round(current_price, 2)
+            try:
+                diff_amount = current_price - df['Close'].iloc[-1]
+                changes[name] = {"amount": diff_amount, "pct": (diff_amount / df['Close'].iloc[-1]) * 100}
+            except:
+                changes[name] = {"amount": 0.0, "pct": 0.0}
+        else:
+            current_price = df['Close'].iloc[-1]
+            prices[name] = round(current_price, 2)
+            diff_amount = df['Close'].iloc[-1] - df['Close'].iloc[-2]
+            changes[name] = {"amount": diff_amount, "pct": (diff_amount / df['Close'].iloc[-2]) * 100}
 
         # 更新今日 K 棒
         today = datetime.now(TW_TZ).date()
