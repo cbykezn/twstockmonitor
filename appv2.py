@@ -16,7 +16,7 @@ try:
 except Exception:
     YF_SESSION = None
 
-st.set_page_config(page_title="台股抄底觀測站", layout="wide")
+st.set_page_config(page_title="台股進場數據觀測", layout="wide")
 st.title("🎯 台股五大關鍵底部觀測面板")
 st.markdown("---")
 
