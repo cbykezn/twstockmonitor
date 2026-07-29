@@ -267,31 +267,72 @@ def start_fugle_ws(symbols: List[str], token: str):
 # -------------------------
 def fetch_fugle_intraday(symbol: str, token: str) -> Dict[str, Any]:
     """
-    symbol: e.g. 'TW.0052'
-    returns: {"price":..., "volume":..., "raw":...} 或 {"error": "..."}
+    使用 Fugle 正式 intraday quote endpoint (v0.3)。
+    - symbol: e.g. 'TW.0052'
+    - token: API token (會放在 X-API-KEY header)
+    回傳: {"price":..., "volume":..., "raw":...} 或 {"error": "..."}
     """
     if not token:
         return {"error": "Fugle token not set"}
-    # 範例 URL，請依 Fugle 官方文件調整為正確的 REST endpoint
-    url = f"https://api.fugle.tw/realtime/v0/intraday?symbol={symbol}&token={token}"
+    url = "https://api.fugle.tw/realtime/v0.3/intraday/quote"
+    headers = {"X-API-KEY": token}
+    params = {"symbolId": symbol}
+
     try:
-        r = requests.get(url, timeout=6)
-        r.raise_for_status()
+        r = requests.get(url, headers=headers, params=params, timeout=8)
+        try:
+            r.raise_for_status()
+        except requests.HTTPError as he:
+            # 顯示 server 回應內容於側欄方便 debug
+            try:
+                st.sidebar.error(f"Fugle REST HTTP {r.status_code} for {symbol}. See raw response below.")
+                try:
+                    st.sidebar.json(r.json())
+                except Exception:
+                    st.sidebar.text(r.text[:2000])
+            except Exception:
+                pass
+            return {"error": f"HTTP {r.status_code}: {he}"}
+
         data = r.json()
-        # 嘗試從常見路徑取得值（依實際回傳欄位改寫）
-        container = data.get("data") or data
-        last = None
-        vol = None
+        container = data.get("data") or data.get("result") or data
+
+        # 嘗試解析 price / volume（針對常見欄位）
+        price = None
+        volume = None
+
         if isinstance(container, dict):
-            last = container.get("lastPrice") or container.get("last") or container.get("price")
-            vol = container.get("volume") or container.get("totalVolume") or container.get("v")
-        # 如果 data 有 nested items
-        if last is None:
-            # 深度搜尋第一個可轉為 float 的欄位（保守）
+            # 常見位置： container['quote']['lastPrice'] 或 container['lastPrice'] 等
+            quote = container.get("quote") if isinstance(container.get("quote"), dict) else container
+            price = quote.get("lastPrice") or quote.get("last") or container.get("lastPrice") or container.get("last")
+            volume = quote.get("volume") or container.get("volume") or container.get("totalVolume")
+            # fallback 深度搜尋數值
+            if price is None:
+                def _deep_find_number(obj):
+                    if isinstance(obj, dict):
+                        for v in obj.values():
+                            res = _deep_find_number(v)
+                            if res is not None:
+                                return res
+                    if isinstance(obj, list):
+                        for it in obj:
+                            res = _deep_find_number(it)
+                            if res is not None:
+                                return res
+                    if isinstance(obj, (int, float)):
+                        return float(obj)
+                    if isinstance(obj, str):
+                        s = obj.replace(",", "")
+                        if s.replace(".", "", 1).isdigit():
+                            return float(s)
+                    return None
+                price = _deep_find_number(container)
+        else:
+            # list or other structures: fallback deep find
             def _deep_find_number(obj):
                 if isinstance(obj, dict):
-                    for vv in obj.values():
-                        res = _deep_find_number(vv)
+                    for v in obj.values():
+                        res = _deep_find_number(v)
                         if res is not None:
                             return res
                 if isinstance(obj, list):
@@ -306,9 +347,16 @@ def fetch_fugle_intraday(symbol: str, token: str) -> Dict[str, Any]:
                     if s.replace(".", "", 1).isdigit():
                         return float(s)
                 return None
-            last = _deep_find_number(container)
-        return {"price": float(last) if last is not None else None, "volume": float(vol) if vol is not None else None, "raw": data}
+            price = _deep_find_number(container)
+
+        return {"price": float(price) if price is not None else None,
+                "volume": float(volume) if volume is not None else None,
+                "raw": data}
     except Exception as e:
+        try:
+            st.sidebar.error(f"Fugle REST request exception for {symbol}: {e}")
+        except Exception:
+            pass
         return {"error": str(e)}
 
 # -------------------------
