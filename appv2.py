@@ -20,12 +20,19 @@ except Exception:
     websocket = None
     WS_AVAILABLE = False
 
-# curl_cffi 載入保護 (yfinance 備用)
+# curl_cffi 載入保護
 try:
     from curl_cffi import requests as cffi_requests
     YF_SESSION = cffi_requests.Session(impersonate="chrome")
 except Exception:
     YF_SESSION = None
+
+# google-generativeai 載入保護
+try:
+    import google.generativeai as genai
+    GENAI_AVAILABLE = True
+except Exception:
+    GENAI_AVAILABLE = False
 
 st.set_page_config(page_title="台股抄底觀測站", layout="wide")
 st.title("🎯 台股五大關鍵底部觀測面板")
@@ -72,7 +79,7 @@ FUGLE_SYMBOL_MAP = {
     "00830": "00830",
 }
 
-# WebSocket 資料儲存區 (執行緒安全)
+# WebSocket 資料儲存區
 from threading import Lock
 _fugle_store = {"data": {}, "lock": Lock()}
 
@@ -85,41 +92,65 @@ def fugle_store_get_all() -> Dict[str, Dict[str, Any]]:
         return dict(_fugle_store["data"])
 
 # -------------------------
-# 讀取 Token
+# 讀取 Token (Fugle & Gemini)
 # -------------------------
-def get_fugle_token_and_source():
-    token = None
-    source = None
-    secrets_keys = None
+def get_api_tokens():
+    fugle_tok = None
+    gemini_tok = None
+    
     try:
         secrets = st.secrets
-        secrets_keys = list(secrets.keys())
+        # 尋找 Fugle
         for k, v in secrets.items():
-            if isinstance(v, str) and v.strip():
-                token = v.strip()
-                source = f"st.secrets['{k}']"
-                break
-            elif hasattr(v, "items"):
+            if k.upper() in ["FUGLE_TOKEN", "FUGLE__TOKEN", "FUGLE_API_KEY", "FUGLE"] and isinstance(v, str):
+                fugle_tok = v.strip()
+            elif hasattr(v, "items") and "FUGLE" in k.upper():
                 for sub_k, sub_v in v.items():
-                    if isinstance(sub_v, str) and sub_v.strip():
-                        token = sub_v.strip()
-                        source = f"st.secrets['{k}']['{sub_k}']"
+                    if isinstance(sub_v, str):
+                        fugle_tok = sub_v.strip()
                         break
-            if token:
-                break
+        # 尋找 Gemini
+        gemini_tok = secrets.get("GEMINI_API_KEY", None)
     except Exception:
-        secrets_keys = None
+        pass
 
-    if not token:
-        for env_key in ("FUGLE_TOKEN", "FUGLE__TOKEN", "FUGLE_API_KEY", "FUGLEKEY"):
-            val = os.environ.get(env_key)
-            if val:
-                token = val.strip()
-                source = f"env:{env_key}"
-                break
-    return token, source, secrets_keys
+    if not fugle_tok:
+        fugle_tok = os.environ.get("FUGLE_TOKEN") or os.environ.get("FUGLE_API_KEY")
+    if not gemini_tok:
+        gemini_tok = os.environ.get("GEMINI_API_KEY")
 
-fugle_token, fugle_token_source, fugle_secrets_keys = get_fugle_token_and_source()
+    return fugle_tok, gemini_tok
+
+fugle_token, gemini_api_key = get_api_tokens()
+
+# -------------------------
+# 🤖 Gemini AI 盤後解析 (設定快取：每天只跑一次)
+# -------------------------
+@st.cache_data(ttl=24*3600)
+def analyze_kline_with_gemini(df_recent_json: str, api_key: str, date_str: str) -> str:
+    if not api_key:
+        return "⚠️ 請在 secrets.toml 設定 GEMINI_API_KEY，即可啟用 AI 自動判斷 K 線型態與盤勢解析。"
+    try:
+        genai.configure(api_key=api_key)
+        model = genai.GenerativeModel('gemini-1.5-flash')
+        prompt = f"""
+        你是一位專業的台股技術分析師。現在的日期是 {date_str}。
+        這是我提供的台股加權指數近 10 個交易日的 OHLCV 報價（JSON格式，日期為鍵值，包含開、高、低、收、量）：
+        {df_recent_json}
+        
+        請根據最新一日的 K 線數據與近 10 日走勢，執行以下任務（請保持客觀、精練）：
+        1. 判斷最新一個交易日的「K 線型態」（例如：實體黑K、實體紅K、長下影線、長上影線、十字線、孕線等）。
+        2. 判斷是否有打底跡象（例如 W 底、破底翻等）。
+        3. 給出一段 100 字以內的精簡盤勢分析。
+        
+        請嚴格依照以下 Markdown 格式輸出：
+        **📌 今日 K 線型態**：[填入型態]
+        **📊 盤勢解析**：[填入精簡分析]
+        """
+        response = model.generate_content(prompt)
+        return response.text
+    except Exception as e:
+        return f"❌ AI 解析發生錯誤：{str(e)}"
 
 # -------------------------
 # Fugle v1.0 WebSocket
@@ -128,23 +159,12 @@ def start_fugle_ws(symbols: List[str], token: str):
     if not WS_AVAILABLE or not token:
         return None
     ws_url = "wss://api.fugle.tw/marketdata/v1.0/stock/streaming"
-    
     def on_open(ws):
-        auth_msg = json.dumps({"event": "auth", "apikey": token})
-        ws.send(auth_msg)
+        ws.send(json.dumps({"event": "auth", "apikey": token}))
         time.sleep(0.5)
-        
         for s in symbols:
-            try:
-                sub_msg = json.dumps({
-                    "event": "subscribe",
-                    "channel": "aggregates",
-                    "symbol": s
-                })
-                ws.send(sub_msg)
-                time.sleep(0.05)
-            except Exception:
-                pass
+            ws.send(json.dumps({"event": "subscribe", "channel": "aggregates", "symbol": s}))
+            time.sleep(0.05)
 
     def on_message(ws, message):
         try:
@@ -152,27 +172,18 @@ def start_fugle_ws(symbols: List[str], token: str):
             if data.get("event") == "data":
                 payload = data.get("data", {})
                 sym_str = str(payload.get("symbol", ""))
-                
-                target_key = None
-                for k, v in FUGLE_SYMBOL_MAP.items():
-                    if sym_str == v or sym_str.endswith(k):
-                        target_key = k
-                        break
-                
+                target_key = next((k for k, v in FUGLE_SYMBOL_MAP.items() if sym_str == v or sym_str.endswith(k)), None)
                 if target_key:
                     price = payload.get("close") or payload.get("price")
                     vol = payload.get("totalAmount") if target_key == "大盤" else payload.get("totalVolume")
-                    tm = payload.get("time") or payload.get("timestamp")
-                    
                     if price:
-                        current_data = fugle_store_get_all().get(target_key, {})
-                        new_data = {
+                        current = fugle_store_get_all().get(target_key, {})
+                        fugle_store_set(target_key, {
                             "price": float(price),
-                            "volume": float(vol) if vol else current_data.get("volume"),
-                            "time": tm,
+                            "volume": float(vol) if vol else current.get("volume"),
+                            "time": payload.get("time") or payload.get("timestamp"),
                             "raw": payload
-                        }
-                        fugle_store_set(target_key, new_data)
+                        })
         except Exception:
             pass
 
@@ -189,33 +200,21 @@ def start_fugle_ws(symbols: List[str], token: str):
     return t
 
 # -------------------------
-# Fugle v1.0 REST API (避免開盤瞬間WS沒資料的備援)
+# Fugle v1.0 REST API (盤中備援)
 # -------------------------
 def fetch_fugle_intraday(symbol: str, token: str) -> Dict[str, Any]:
-    if not token:
-        return {"error": "Fugle token not set"}
-    
+    if not token: return {"error": "No token"}
     clean_symbol = str(symbol).strip()
-    headers = {"X-API-KEY": token}
     url = f"https://api.fugle.tw/marketdata/v1.0/stock/intraday/quote/{clean_symbol}"
-    
     try:
-        r = requests.get(url, headers=headers, timeout=8)
-        if r.status_code != 200:
-            return {"error": f"HTTP {r.status_code}"}
-        
-        data = r.json()
-        quote = data.get("data", {}) if "data" in data else data
-        
+        r = requests.get(url, headers={"X-API-KEY": token}, timeout=8)
+        if r.status_code != 200: return {"error": f"HTTP {r.status_code}"}
+        quote = r.json().get("data", r.json())
         price = quote.get("closePrice") or quote.get("lastPrice") or quote.get("price")
-        if clean_symbol == "IX0001":
-             vol = quote.get("totalAmount") or quote.get("amount")
-        else:
-             vol = quote.get("totalVolume") or quote.get("total") or quote.get("volume")
-        
+        vol = quote.get("totalAmount") if clean_symbol == "IX0001" else (quote.get("totalVolume") or quote.get("volume"))
         if price is not None:
             return {"price": float(price), "volume": float(vol) if vol is not None else None, "raw": quote}
-        return {"error": "Cannot parse price from v1.0 response"}
+        return {"error": "Parse error"}
     except Exception as e:
         return {"error": str(e)}
 
@@ -226,53 +225,32 @@ def fetch_fugle_intraday(symbol: str, token: str) -> Dict[str, Any]:
 def fetch_twse_market_turnover():
     try:
         url = "https://www.twse.com.tw/exchangeReport/FMTQIK?response=json"
-        headers = {'User-Agent': 'Mozilla/5.0'}
-        res = requests.get(url, headers=headers, timeout=10)
+        res = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=10)
         data = res.json()
         if data.get('stat') == 'OK':
-            latest_row = data['data'][-1]
-            raw_amount_str = latest_row[2].replace(',', '')
-            turnover_yi = round(float(raw_amount_str) / 100000000.0, 2)
-            return turnover_yi, "Success"
+            return round(float(data['data'][-1][2].replace(',', '')) / 100000000.0, 2), "Success"
         return None, "API Error"
     except Exception as e:
         return None, str(e)
 
-@st.cache_data(ttl=3600)  # 1小時快取一次即可，減輕證交所負擔
+@st.cache_data(ttl=3600)
 def fetch_twse_historical_turnover_20d():
-    """ 自動計算證交所官方近 20 個交易日的「真實平均成交金額」 """
     try:
         today = datetime.now(TW_TZ)
-        date_this_month = today.strftime("%Y%m%d")
-        last_month_dt = today.replace(day=1) - timedelta(days=1)
-        date_last_month = last_month_dt.strftime("%Y%m%d")
-        
+        date_this = today.strftime("%Y%m%d")
+        date_last = (today.replace(day=1) - timedelta(days=1)).strftime("%Y%m%d")
         headers = {'User-Agent': 'Mozilla/5.0'}
         
-        # 抓取本月
-        url_this = f"https://www.twse.com.tw/exchangeReport/FMTQIK?response=json&date={date_this_month}"
-        res_this = requests.get(url_this, headers=headers, timeout=10).json()
-        data_this = res_this.get('data', [])
-        
-        # 如果本月交易日不足 20 天，回溯抓取上個月
+        data_this = requests.get(f"https://www.twse.com.tw/exchangeReport/FMTQIK?response=json&date={date_this}", headers=headers, timeout=10).json().get('data', [])
+        combined = data_this
         if len(data_this) < 20:
-            time.sleep(1) # 禮貌性延遲
-            url_last = f"https://www.twse.com.tw/exchangeReport/FMTQIK?response=json&date={date_last_month}"
-            res_last = requests.get(url_last, headers=headers, timeout=10).json()
-            data_last = res_last.get('data', [])
+            time.sleep(1)
+            data_last = requests.get(f"https://www.twse.com.tw/exchangeReport/FMTQIK?response=json&date={date_last}", headers=headers, timeout=10).json().get('data', [])
             combined = data_last + data_this
-        else:
-            combined = data_this
             
-        if not combined:
-            return 4500.0, "無資料"
-            
-        # 切片取最新 20 筆
+        if not combined: return 4500.0, "無資料"
         last_20 = combined[-20:]
-        turnover_list = [float(row[2].replace(',', '')) for row in last_20]
-        
-        avg_amt = sum(turnover_list) / len(turnover_list)
-        avg_yi = round(avg_amt / 100000000.0, 2)
+        avg_yi = round((sum([float(row[2].replace(',', '')) for row in last_20]) / len(last_20)) / 100000000.0, 2)
         return avg_yi, "Success"
     except Exception as e:
         return 4500.0, f"Error: {e}"
@@ -323,36 +301,27 @@ if "fugle_ws_started" not in st.session_state:
 
 if not st.session_state["fugle_ws_started"]:
     if fugle_token and WS_AVAILABLE:
-        symbols_to_sub = list(FUGLE_SYMBOL_MAP.values())
-        start_fugle_ws(symbols_to_sub, fugle_token)
+        start_fugle_ws(list(FUGLE_SYMBOL_MAP.values()), fugle_token)
         st.session_state["fugle_ws_started"] = True
-        st.sidebar.success("🔌 Fugle API v1.0 即時串流連線已啟動。")
 
-with st.spinner('正在同步數據、計算 KD 指標與最新報價...'):
+with st.spinner('正在同步數據、計算指標與 AI 解析...'):
     fugle_snapshot = fugle_store_get_all()
     realtime_quotes = {}
     
     for key, fugle_sym in FUGLE_SYMBOL_MAP.items():
         entry = fugle_snapshot.get(key)
         if entry and (entry.get("price") is not None):
-            realtime_quotes[key] = {
-                "price": entry.get("price"),
-                "volume": entry.get("volume")
-            }
+            realtime_quotes[key] = {"price": entry.get("price"), "volume": entry.get("volume")}
         else:
             fallback = fetch_fugle_intraday(fugle_sym, fugle_token) if fugle_token else {"error": "no token"}
             if "error" not in fallback:
-                realtime_quotes[key] = {
-                    "price": fallback.get("price"),
-                    "volume": fallback.get("volume")
-                }
+                realtime_quotes[key] = {"price": fallback.get("price"), "volume": fallback.get("volume")}
                 fugle_store_set(key, fallback)
 
     @st.cache_data(ttl=6 * 60 * 60)
     def fetch_history(symbol, cache_date):
         ticker = yf.Ticker(symbol, session=YF_SESSION) if YF_SESSION else yf.Ticker(symbol)
-        df = ticker.history(period="1y")
-        return df
+        return ticker.history(period="1y")
 
     today_str = datetime.now(TW_TZ).strftime("%Y-%m-%d")
     prices, changes, history_dfs, ma20_now, ma20_prev, kd_data = {}, {}, {}, {}, {}, {}
@@ -364,11 +333,9 @@ with st.spinner('正在同步數據、計算 KD 指標與最新報價...'):
         except Exception:
             continue
 
-        current_price = None
-        rt = realtime_quotes.get(name, {})
+        current_price = realtime_quotes.get(name, {}).get("price")
         
-        if rt.get("price") is not None:
-            current_price = rt["price"]
+        if current_price is not None:
             prices[name] = round(current_price, 2)
             try:
                 diff_amount = current_price - df['Close'].iloc[-1]
@@ -381,25 +348,23 @@ with st.spinner('正在同步數據、計算 KD 指標與最新報價...'):
             diff_amount = df['Close'].iloc[-1] - df['Close'].iloc[-2]
             changes[name] = {"amount": diff_amount, "pct": (diff_amount / df['Close'].iloc[-2]) * 100}
 
-        # 將今日即時價格寫入歷史K線，確保當天日K與均線準確
+        # 更新今日 K 棒
         today = datetime.now(TW_TZ).date()
         if current_price is not None and df.index[-1].date() == today:
             df.loc[df.index[-1], "Close"] = current_price
             df.loc[df.index[-1], "High"] = max(df["High"].iloc[-1], current_price)
             df.loc[df.index[-1], "Low"] = min(df["Low"].iloc[-1], current_price)
 
-        # 計算指標
         df = compute_indicators(df)
         history_dfs[name] = df
         ma20_now[name] = round(df['20MA'].iloc[-1], 2)
         ma20_prev[name] = round(df['20MA'].iloc[-2], 2)
         kd_data[name] = {"K": round(df['K'].iloc[-1], 2), "D": round(df['D'].iloc[-1], 2)}
 
-    # === 動態判定大盤成交量 ===
+    # === 成交量抓取 ===
     twse_vol, twse_msg = fetch_twse_market_turnover()
     fugle_twii_vol = realtime_quotes.get("大盤", {}).get("volume")
     
-    # 判斷目前使用的即時成交量
     if fugle_twii_vol and fugle_twii_vol > 1000000:
         final_daily_volume = round(fugle_twii_vol / 100000000.0, 2)
         vol_source = "Fugle盤中即時"
@@ -410,7 +375,6 @@ with st.spinner('正在同步數據、計算 KD 指標與最新報價...'):
         final_daily_volume = 3200.0
         vol_source = "手動預設"
         
-    # === 計算官方 20 日均量 ===
     twse_20d_avg, twse_20d_msg = fetch_twse_historical_turnover_20d()
 
     if len(prices) == 4:
@@ -423,26 +387,45 @@ with st.spinner('正在同步數據、計算 KD 指標與最新報價...'):
         loss_830 = round(((prices["00830"] - cost_830) / cost_830) * 100, 2)
         loss_662 = round(((prices["00662"] - cost_662) / cost_662) * 100, 2)
 
+        # 繪製圖表
         st.plotly_chart(draw_professional_chart(history_dfs["大盤"], "加權指數 (大盤)"), use_container_width=True)
+        
+        # 🤖 觸發 Gemini AI 盤後解析
+        st.markdown("##### 🤖 Gemini 雙子星 AI 盤後解析")
+        if GENAI_AVAILABLE and gemini_api_key:
+            # 取近 10 日資料餵給 AI (簡化浮點數避免超出字數)
+            recent_df = history_dfs["大盤"].tail(10)[['Open', 'High', 'Low', 'Close', 'Volume']].copy()
+            recent_df = recent_df.round(2)
+            recent_df.index = recent_df.index.strftime('%Y-%m-%d')
+            json_payload = recent_df.to_json(orient="index")
+            
+            ai_analysis_result = analyze_kline_with_gemini(json_payload, gemini_api_key, today_str)
+            st.info(ai_analysis_result)
+        elif not GENAI_AVAILABLE:
+            st.warning("⚠️ 尚未安裝 Google AI 套件，請在終端機執行 `pip install google-generativeai`。")
+        else:
+            st.warning("⚠️ 請在 secrets.toml 檔案中設定 `GEMINI_API_KEY` 即可啟用 AI 盤勢分析。")
+
         st.markdown("---")
 
+        # 顯示主要數據
         col1, col2, col3, col4 = st.columns(4)
         
-        # 側邊欄設定區
+        # === 🌟 側邊欄設定區 (加入量能萎縮百分比) ===
         st.sidebar.markdown("---")
         st.sidebar.write("📌 **大盤量能基準設定**")
-        
-        # 預設帶入官方算出來的 20 日均量，保留手動調整彈性
         avg_vol_20 = st.sidebar.number_input("官方近 20 日均量 (億)", value=float(twse_20d_avg), step=100.0)
-        if twse_20d_msg == "Success":
-            st.sidebar.caption("✅ 已自動同步 TWSE 官方近 20 交易日均量")
-        else:
-            st.sidebar.caption(f"⚠️ 官方均量同步失敗，使用預設值 ({twse_20d_msg})")
-
         daily_volume = st.sidebar.number_input(f"今日大盤成交量 ({vol_source}) 億", value=float(final_daily_volume), step=50.0, format="%.2f")
         
+        # 計算佔均量百分比
+        vol_percentage = (daily_volume / avg_vol_20 * 100) if avg_vol_20 > 0 else 0
+        if vol_percentage <= 70:
+            st.sidebar.success(f"🔥 **今日量縮比：{vol_percentage:.1f}%**\n\n(小於 70%，已達窒息量標準)")
+        else:
+            st.sidebar.warning(f"📊 **今日量縮比：{vol_percentage:.1f}%**\n\n(大於 70%，尚有賣壓未枯竭)")
+
         twse_vol_display = format_volume(twse_vol) if twse_vol else "尚未公布或抓取失敗"
-        st.sidebar.info(f"🏛️ **官方(證交所)最新結算量**\n\n📌 **{twse_vol_display}**")
+        st.sidebar.info(f"🏛️ **官方盤後結算量**：**{twse_vol_display}**")
 
         vol_text = f"今日成交: {format_volume(daily_volume)}"
 
@@ -451,6 +434,7 @@ with st.spinner('正在同步數據、計算 KD 指標與最新報價...'):
         col3.metric(f"📦 00830 (損益: {loss_830}%)", f"{prices['00830']}", f"{changes['00830']['amount']:+.2f} ({changes['00830']['pct']:+.2f}%)", delta_color="inverse")
         col4.metric(f"📦 00662 (損益: {loss_662}%)", f"{prices['00662']}", f"{changes['00662']['amount']:+.2f} ({changes['00662']['pct']:+.2f}%)", delta_color="inverse")
 
+        # 最新 KD 指標面板
         st.markdown("##### 📉 最新 KD 指標與交叉訊號")
         k_col1, k_col2, k_col3, k_col4 = st.columns(4)
         def render_kd(col, name, kd_dict):
@@ -467,28 +451,19 @@ with st.spinner('正在同步數據、計算 KD 指標與最新報價...'):
         st.caption(f"{'🔴 盤中即時更新中（以 Fugle v1.0 數據為主）' if is_market_open() else '⚪ 目前非交易時間，顯示為最後收盤資料'}")
         st.markdown("---")
 
-        # === 🎯 五筆資金進場策略邏輯 (嚴格依照定義重構) ===
+        # === 🎯 五筆資金進場策略邏輯 ===
         st.sidebar.markdown("---")
         st.sidebar.write("📌 **主觀型態與防守判定**")
         stage2_no_new_low = st.sidebar.checkbox("✅ 指數近期沒有再創新低", value=False)
         break_39384 = st.sidebar.checkbox("⚠️ 大盤是否已跌破 39,384 點？", value=False)
-        candle_shape = st.sidebar.selectbox("今日大盤 K 線型態", ["實體黑K", "實體紅K", "長下影線", "W底成型", "放量長紅"])
+        candle_shape = st.sidebar.selectbox("今日大盤 K 線型態", ["實體黑K", "實體紅K", "長下影線", "十字線", "W底成型", "放量長紅"])
         weeks_passed = st.sidebar.slider("距離 7/29 已過幾週？", 0, 8, 0)
 
-        # 條件 1：大盤跌到 36k-38k，或 00830/00662 帳面損益 <= -15%
         cond1 = (36000 <= prices["大盤"] <= 38000) or (loss_830 <= -15.0) or (loss_662 <= -15.0)
-        
-        # 條件 2：成交量 <= 3500億，或低於近20日均量的70%，且沒有再創新低
-        cond_volume_shrink = (daily_volume <= 3500) or (daily_volume <= avg_vol_20 * 0.7)
+        cond_volume_shrink = (daily_volume <= 3500) or (vol_percentage <= 70)
         cond2 = cond_volume_shrink and stage2_no_new_low
-        
-        # 條件 3：經過 3-4 週，且沒有跌破 39384 點
         cond3 = (3 <= weeks_passed <= 4) and not break_39384
-        
-        # 條件 4：測試前低 (例如 <= 41000) 且拉出長下影線或W底
-        cond4 = (prices["大盤"] <= 41000) and (candle_shape in ["長下影線", "W底成型"])
-        
-        # 條件 5：大盤、00830、00662 皆站上 20MA，且 20MA 皆轉為上揚
+        cond4 = (prices["大盤"] <= 41000) and (candle_shape in ["長下影線", "十字線", "W底成型"])
         check_list = ["大盤", "00830", "00662"]
         cond5 = all(prices[n] > ma20_now[n] for n in check_list) and all(ma20_now[n] > ma20_prev[n] for n in check_list)
 
@@ -499,30 +474,25 @@ with st.spinner('正在同步數據、計算 KD 指標與最新報價...'):
                 else: st.error(f"### 🔴 鎖定中\n**第 {title} 筆**\n\n{fail_msg}")
 
         c1, c2, c3, c4, c5 = st.columns(5)
-        
         render_card(c1, "1. 空間的極致", cond1, 
-                    f"已達防禦區間！\n大盤: {prices['大盤']:,.0f}\n00830 損益: {loss_830}%\n00662 損益: {loss_662}%", 
-                    f"未達防禦深度\n大盤: {prices['大盤']:,.0f}\n最深損益未達 -15%")
-                    
+                    f"已達防禦區間！\n大盤: {prices['大盤']:,.0f}", 
+                    f"未達防禦深度\n大盤: {prices['大盤']:,.0f}")
         render_card(c2, "2. 量能的窒息", cond2, 
-                    f"賣壓枯竭，籌碼乾淨！\n成交量: {format_volume(daily_volume)}\n未創新低: 是", 
-                    f"量縮或型態未滿足\n成交量: {format_volume(daily_volume)}\n未創新低: {'是' if stage2_no_new_low else '否'}")
-                    
+                    f"賣壓枯竭，籌碼乾淨！\n量縮比: {vol_percentage:.1f}%", 
+                    f"量縮未滿足\n量縮比: {vol_percentage:.1f}%")
         render_card(c3, "3. 時間的折磨", cond3, 
-                    f"底部承接力道確認！\n已過 {weeks_passed} 週\n破 39384: 否", 
-                    f"時間未到或破底\n已過 {weeks_passed} 週\n破 39384: {'是' if break_39384 else '否'}")
-                    
+                    f"底部承接力道確認！\n已過 {weeks_passed} 週", 
+                    f"時間未到或破底\n已過 {weeks_passed} 週")
         render_card(c4, "4. 型態的確認", cond4, 
-                    f"第二隻腳打底完成！\n目前型態: {candle_shape}", 
-                    f"打底型態尚未確認\n目前型態: {candle_shape}")
-                    
+                    f"第二隻腳打底完成！\n型態: {candle_shape}", 
+                    f"打底型態未確認\n型態: {candle_shape}")
         render_card(c5, "5. 趨勢的反轉", cond5, 
                     f"消化完成，多頭啟動！\n三者站上且月線上揚", 
-                    f"右側趨勢尚未確認\n均線未全面站上或上揚")
+                    f"右側趨勢未確認\n均線未全面站上或上揚")
 
         st.markdown("---")
         triggered_count = sum([cond1, cond2, cond3, cond4, cond5])
         if triggered_count > 0:
-            st.info(f"🚨 **執行紀律：已有 {triggered_count} 筆資金達成觸發條件。請無視市場雜音，冷酷執行對應部位的進場！**")
+            st.info(f"🚨 **執行紀律：已有 {triggered_count} 筆資金達成觸發條件。請冷酷執行對應部位的進場！**")
         else:
             st.warning("☕ **空手觀望：目前尚無任何一筆資金觸發條件。保單借款利息是你買「從容」的成本，請耐心等待。**")
