@@ -5,6 +5,7 @@ import threading
 import requests
 import traceback
 import streamlit as st
+import yfinance as yf
 import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
@@ -18,6 +19,13 @@ try:
 except Exception:
     websocket = None
     WS_AVAILABLE = False
+
+# curl_cffi 載入保護
+try:
+    from curl_cffi import requests as cffi_requests
+    YF_SESSION = cffi_requests.Session(impersonate="chrome")
+except Exception:
+    YF_SESSION = None
 
 # google-generativeai 載入保護
 try:
@@ -71,6 +79,7 @@ FUGLE_SYMBOL_MAP = {
     "00830": "00830",
 }
 
+# WebSocket 資料儲存區
 from threading import Lock
 _fugle_store = {"data": {}, "lock": Lock()}
 
@@ -88,23 +97,31 @@ def fugle_store_get_all() -> Dict[str, Dict[str, Any]]:
 def get_api_tokens():
     fugle_tok = None
     gemini_tok = None
+    
     try:
         secrets = st.secrets
         for k, v in secrets.items():
             k_upper = k.upper()
             if isinstance(v, str):
-                if "FUGLE" in k_upper: fugle_tok = v.strip()
-                if "GEMINI" in k_upper: gemini_tok = v.strip()
+                if "FUGLE" in k_upper:
+                    fugle_tok = v.strip()
+                if "GEMINI" in k_upper:
+                    gemini_tok = v.strip()
             elif hasattr(v, "items"):
                 for sub_k, sub_v in v.items():
                     if isinstance(sub_v, str):
-                        if "FUGLE" in k_upper or "FUGLE" in sub_k.upper(): fugle_tok = sub_v.strip()
-                        if "GEMINI" in k_upper or "GEMINI" in sub_k.upper(): gemini_tok = sub_v.strip()
+                        if "FUGLE" in k_upper or "FUGLE" in sub_k.upper():
+                            fugle_tok = sub_v.strip()
+                        if "GEMINI" in k_upper or "GEMINI" in sub_k.upper():
+                            gemini_tok = sub_v.strip()
     except Exception:
         pass
 
-    if not fugle_tok: fugle_tok = os.environ.get("FUGLE_TOKEN") or os.environ.get("FUGLE_API_KEY")
-    if not gemini_tok: gemini_tok = os.environ.get("GEMINI_API_KEY")
+    if not fugle_tok:
+        fugle_tok = os.environ.get("FUGLE_TOKEN") or os.environ.get("FUGLE_API_KEY")
+    if not gemini_tok:
+        gemini_tok = os.environ.get("GEMINI_API_KEY")
+
     return fugle_tok, gemini_tok
 
 fugle_token, gemini_api_key = get_api_tokens()
@@ -132,22 +149,27 @@ def analyze_kline_with_gemini(df_recent_json: str, api_key: str, date_str: str) 
         **📌 今日 K 線型態**：[填入型態]
         **📊 盤勢解析**：[填入精簡分析]
         """
-        for m_name in ['gemini-1.5-flash', 'gemini-1.5-flash-latest', 'gemini-pro']:
+        
+        models_to_try = ['gemini-1.5-flash', 'gemini-1.5-flash-latest', 'gemini-pro']
+        last_error = ""
+        for m_name in models_to_try:
             try:
                 model = genai.GenerativeModel(m_name)
                 response = model.generate_content(prompt)
                 return response.text
-            except Exception:
+            except Exception as e:
+                last_error = str(e)
                 continue
-        return "❌ AI 解析發生錯誤：所有模型嘗試皆失敗。"
+        return f"❌ AI 解析發生錯誤：{last_error}"
     except Exception as e:
         return f"❌ AI 設定發生錯誤：{str(e)}"
 
 # -------------------------
-# 🏛️ 臺灣證券交易所官方 OpenAPI 專用區
+# 🏛️ 臺灣證券交易所 OpenAPI 專用區
 # -------------------------
 @st.cache_data(ttl=10)
 def fetch_twse_summary():
+    """ 抓取證交所官方即時大盤摘要 """
     try:
         headers = {'User-Agent': 'Mozilla/5.0'}
         ts = int(datetime.now().timestamp() * 1000)
@@ -166,12 +188,18 @@ def fetch_twse_summary():
 
 @st.cache_data(ttl=60)
 def fetch_twse_stock_day_all():
+    """ 抓取證交所官方每日所有股票與 ETF 收盤行情 (STOCK_DAY_ALL) """
     try:
         url = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"
         res = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=10)
         res.raise_for_status()
         data = res.json()
-        return {item.get("Code"): item for item in data if item.get("Code")}, "Success"
+        result = {}
+        for item in data:
+            code = item.get("Code")
+            if code:
+                result[code] = item
+        return result, "Success"
     except Exception as e:
         return {}, str(e)
 
@@ -194,103 +222,20 @@ def fetch_twse_historical_turnover_20d():
         date_this = today.strftime("%Y%m%d")
         date_last = (today.replace(day=1) - timedelta(days=1)).strftime("%Y%m%d")
         headers = {'User-Agent': 'Mozilla/5.0'}
+        
         data_this = requests.get(f"https://www.twse.com.tw/exchangeReport/FMTQIK?response=json&date={date_this}", headers=headers, timeout=10).json().get('data', [])
         combined = data_this
         if len(data_this) < 20:
             time.sleep(1)
             data_last = requests.get(f"https://www.twse.com.tw/exchangeReport/FMTQIK?response=json&date={date_last}", headers=headers, timeout=10).json().get('data', [])
             combined = data_last + data_this
+            
         if not combined: return 4500.0, "無資料"
         last_20 = combined[-20:]
         avg_yi = round((sum([float(row[2].replace(',', '')) for row in last_20]) / len(last_20)) / 100000000.0, 2)
         return avg_yi, "Success"
     except Exception as e:
         return 4500.0, f"Error: {e}"
-
-# 🌟 加強防呆保護的歷史 OHLCV 抓取函式
-@st.cache_data(ttl=12*3600)
-def fetch_twse_historical_ohlcv(symbol: str) -> pd.DataFrame:
-    all_rows = []
-    now = datetime.now(TW_TZ)
-    dates_to_fetch = []
-    curr = now.replace(day=1)
-    for _ in range(13):
-        dates_to_fetch.append(curr.strftime("%Y%m01"))
-        curr = (curr - timedelta(days=1)).replace(day=1)
-        
-    headers = {'User-Agent': 'Mozilla/5.0'}
-    
-    if symbol == "大盤":
-        for d_str in reversed(dates_to_fetch):
-            try:
-                url = f"https://www.twse.com.tw/exchangeReport/FMTQIK?response=json&date={d_str}"
-                res = requests.get(url, headers=headers, timeout=5)
-                if res.status_code == 200:
-                    js = res.json()
-                    if js.get('stat') == 'OK' and 'data' in js:
-                        all_rows.extend(js['data'])
-                time.sleep(0.3)
-            except Exception:
-                pass
-        if not all_rows: return pd.DataFrame()
-        df = pd.DataFrame(all_rows)
-        # 確保 DataFrame 至少有 8 個欄位 (0~7)
-        if df.shape[1] < 8: return pd.DataFrame()
-        cols = {0: 'Date', 1: 'Volume', 4: 'Open', 5: 'High', 6: 'Low', 7: 'Close'}
-        df = df[list(cols.keys())].rename(columns=cols)
-    else:
-        for d_str in reversed(dates_to_fetch):
-            try:
-                url = f"https://www.twse.com.tw/exchangeReport/STOCK_DAY?response=json&date={d_str}&stockNo={symbol}"
-                res = requests.get(url, headers=headers, timeout=5)
-                if res.status_code == 200:
-                    js = res.json()
-                    if js.get('stat') == 'OK' and 'data' in js:
-                        all_rows.extend(js['data'])
-                time.sleep(0.3)
-            except Exception:
-                pass
-        if not all_rows: return pd.DataFrame()
-        df = pd.DataFrame(all_rows)
-        # 確保 DataFrame 至少有 7 個欄位 (0~6)
-        if df.shape[1] < 7: return pd.DataFrame()
-        cols = {0: 'Date', 1: 'Volume', 3: 'Open', 4: 'High', 5: 'Low', 6: 'Close'}
-        df = df[list(cols.keys())].rename(columns=cols)
-
-    def clean_date(d_str):
-        try:
-            parts = str(d_str).split('/')
-            if len(parts) == 3:
-                year = int(parts[0]) + 1911
-                return pd.Timestamp(f"{year}-{parts[1]}-{parts[2]}")
-        except:
-            pass
-        return pd.NaT
-
-    df['Date'] = df['Date'].apply(clean_date)
-    df = df.dropna(subset=['Date']).sort_values('Date').set_index('Date')
-    
-    for col in ['Open', 'High', 'Low', 'Close', 'Volume']:
-        if col in df.columns:
-            df[col] = df[col].astype(str).str.replace(',', '').astype(float)
-        
-    return df
-
-def fetch_fugle_intraday(symbol: str, token: str) -> Dict[str, Any]:
-    if not token: return {"error": "No token"}
-    clean_symbol = str(symbol).strip()
-    url = f"https://api.fugle.tw/marketdata/v1.0/stock/intraday/quote/{clean_symbol}"
-    try:
-        r = requests.get(url, headers={"X-API-KEY": token}, timeout=6)
-        if r.status_code != 200: return {"error": f"HTTP {r.status_code}"}
-        quote = r.json().get("data", r.json())
-        price = quote.get("closePrice") or quote.get("lastPrice") or quote.get("price") or quote.get("previousClose")
-        vol = quote.get("totalAmount") if clean_symbol == "IX0001" else (quote.get("totalVolume") or quote.get("volume"))
-        if price is not None:
-            return {"price": float(price), "volume": float(vol) if vol is not None else None}
-        return {"error": "Parse error"}
-    except Exception as e:
-        return {"error": str(e)}
 
 # -------------------------
 # 指標與圖表
@@ -331,7 +276,7 @@ def draw_professional_chart(df, title_name):
 # -------------------------
 # 主程式執行區
 # -------------------------
-tickers = {"大盤": "大盤", "0052": "0052", "00830": "00830", "00662": "00662"}
+tickers = {"大盤": "^TWII", "0052": "0052.TW", "00830": "00830.TW", "00662": "00662.TW"}
 
 with st.spinner('正在同步證交所官方 OpenAPI 數據、計算指標與 AI 解析...'):
     twse_summary, _ = fetch_twse_summary()
@@ -339,12 +284,22 @@ with st.spinner('正在同步證交所官方 OpenAPI 數據、計算指標與 AI
     twse_vol, _ = fetch_twse_market_turnover()
     twse_20d_avg, _ = fetch_twse_historical_turnover_20d()
 
+    @st.cache_data(ttl=6 * 60 * 60)
+    def fetch_history(symbol, cache_date):
+        ticker = yf.Ticker(symbol, session=YF_SESSION) if YF_SESSION else yf.Ticker(symbol)
+        return ticker.history(period="1y")
+
+    today_str = datetime.now(TW_TZ).strftime("%Y-%m-%d")
     prices, changes, history_dfs, ma20_now, ma20_prev, kd_data = {}, {}, {}, {}, {}, {}
 
     for name, symbol in tickers.items():
-        df = fetch_twse_historical_ohlcv(symbol)
-        if df.empty: continue
-        
+        try:
+            df = fetch_history(symbol, today_str)
+            if df.empty: continue
+        except Exception:
+            continue
+
+        # === 🌟 價格與漲跌來源：大盤用證交所 Summary，個股/ETF 改抓證交所官方 STOCK_DAY_ALL OpenAPI ===
         if name == "大盤" and twse_summary.get("index") is not None:
             current_price = twse_summary["index"]
             diff_amount = twse_summary["diff"]
@@ -352,7 +307,10 @@ with st.spinner('正在同步證交所官方 OpenAPI 數據、計算指標與 AI
             prices[name] = round(current_price, 2)
             changes[name] = {"amount": diff_amount, "pct": pct}
         else:
-            stock_info = twse_stock_day.get(name, {})
+            # 從證交所 STOCK_DAY_ALL 抓取對應代號 (例如 0052, 00830, 00662)
+            code_str = name # 剛好鍵名就是代號
+            stock_info = twse_stock_day.get(code_str, {})
+            
             close_str = stock_info.get("ClosingPrice", "").replace(",", "")
             change_str = stock_info.get("Change", "").replace(",", "")
             
@@ -361,24 +319,17 @@ with st.spinner('正在同步證交所官方 OpenAPI 數據、計算指標與 AI
                 diff_amount = float(change_str) if change_str else 0.0
                 prev_close = current_price - diff_amount
                 pct_val = (diff_amount / prev_close * 100) if prev_close > 0 else 0.0
+                
                 prices[name] = round(current_price, 2)
                 changes[name] = {"amount": round(diff_amount, 2), "pct": round(pct_val, 2)}
             else:
-                fugle_res = fetch_fugle_intraday(name, fugle_token) if fugle_token else {"error": "no token"}
-                if "error" not in fugle_res and fugle_res.get("price") is not None:
-                    current_price = fugle_res["price"]
-                    prev_close = float(df['Close'].iloc[-2]) if len(df) >= 2 else current_price
-                    diff_amount = current_price - prev_close
-                    pct_val = (diff_amount / prev_close * 100) if prev_close > 0 else 0.0
-                    prices[name] = round(current_price, 2)
-                    changes[name] = {"amount": round(diff_amount, 2), "pct": round(pct_val, 2)}
-                else:
-                    current_price = float(df['Close'].iloc[-1])
-                    prev_close = float(df['Close'].iloc[-2]) if len(df) >= 2 else current_price
-                    diff_amount = current_price - prev_close
-                    pct_val = (diff_amount / prev_close * 100) if prev_close > 0 else 0.0
-                    prices[name] = round(current_price, 2)
-                    changes[name] = {"amount": round(diff_amount, 2), "pct": round(pct_val, 2)}
+                # 最終安全防線 (若證交所 OpenAPI 暫時沒抓到)
+                current_price = float(df['Close'].iloc[-1])
+                prev_close = float(df['Close'].iloc[-2]) if len(df) >= 2 else current_price
+                diff_amount = current_price - prev_close
+                pct_val = (diff_amount / prev_close * 100) if prev_close > 0 else 0.0
+                prices[name] = round(current_price, 2)
+                changes[name] = {"amount": round(diff_amount, 2), "pct": round(pct_val, 2)}
 
         df = compute_indicators(df)
         history_dfs[name] = df
@@ -386,9 +337,9 @@ with st.spinner('正在同步證交所官方 OpenAPI 數據、計算指標與 AI
         ma20_prev[name] = round(df['20MA'].iloc[-2], 2)
         kd_data[name] = {"K": round(df['K'].iloc[-1], 2), "D": round(df['D'].iloc[-1], 2)}
 
+    # 成交量決定
     final_daily_volume = twse_vol if twse_vol is not None else 3200.0
     vol_source = "TWSE盤後數據"
-    today_str = datetime.now(TW_TZ).strftime("%Y-%m-%d")
 
     if len(prices) == 4:
         st.sidebar.header("⚙️ 參數設定與盤中觀察")
@@ -400,9 +351,10 @@ with st.spinner('正在同步證交所官方 OpenAPI 數據、計算指標與 AI
         loss_830 = round(((prices["00830"] - cost_830) / cost_830) * 100, 2)
         loss_662 = round(((prices["00662"] - cost_662) / cost_662) * 100, 2)
 
+        # 繪製圖表
         st.plotly_chart(draw_professional_chart(history_dfs["大盤"], "加權指數 (大盤)"), use_container_width=True)
         
-        # AI 盤後解析
+        # 🤖 觸發 Gemini AI 盤後解析
         st.markdown("##### 🤖 Gemini 雙子星 AI 盤後解析")
         if GENAI_AVAILABLE and gemini_api_key:
             if is_market_open():
@@ -412,6 +364,7 @@ with st.spinner('正在同步證交所官方 OpenAPI 數據、計算指標與 AI
                 recent_df = recent_df.round(2)
                 recent_df.index = recent_df.index.strftime('%Y-%m-%d')
                 json_payload = recent_df.to_json(orient="index")
+                
                 ai_analysis_result = analyze_kline_with_gemini(json_payload, gemini_api_key, today_str)
                 st.info(ai_analysis_result)
         elif not GENAI_AVAILABLE:
