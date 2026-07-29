@@ -1,3 +1,4 @@
+# app.py
 import streamlit as st
 import yfinance as yf
 import pandas as pd
@@ -6,15 +7,14 @@ from plotly.subplots import make_subplots
 import requests
 import time
 from datetime import datetime, timezone, timedelta
+from typing import Tuple, Dict, Any, Optional
 
-# yfinance 目前很容易被 Yahoo 判定為機器人而觸發限流（YFRateLimitError）。
-# 解法：用 curl_cffi 模擬 Chrome 瀏覽器的 TLS 指紋來建立連線 session。
-# 需要安裝: pip install curl_cffi
+# 嘗試用 curl_cffi 讓 yfinance 的 session 模擬 Chrome TLS 指紋 (可選)
 try:
     from curl_cffi import requests as cffi_requests
     YF_SESSION = cffi_requests.Session(impersonate="chrome")
-except ImportError:
-    YF_SESSION = None  # 沒裝 curl_cffi 就退回 yfinance 預設連線方式
+except Exception:
+    YF_SESSION = None
 
 st.set_page_config(page_title="台股抄底觀測站", layout="wide")
 st.title("🎯 台股五大關鍵底部觀測面板")
@@ -22,21 +22,15 @@ st.markdown("---")
 
 TW_TZ = timezone(timedelta(hours=8))
 
-# ============================================================
-# 盤中時間判斷 (平日 09:00 ~ 13:30)
-# ============================================================
 def is_market_open():
     now = datetime.now(TW_TZ)
-    if now.weekday() >= 5:  # 週六日
+    if now.weekday() >= 5:
         return False
     start = now.replace(hour=9, minute=0, second=0, microsecond=0)
     end = now.replace(hour=13, minute=30, second=0, microsecond=0)
     return start <= now <= end
 
-# ============================================================
-# 自動刷新（僅在盤中啟用，避免收盤後浪費資源狂打 API）
-# 需要安裝: pip install streamlit-autorefresh
-# ============================================================
+# 自動刷新 (盤中)
 AUTOREFRESH_OK = True
 try:
     from streamlit_autorefresh import st_autorefresh
@@ -44,12 +38,10 @@ except ImportError:
     AUTOREFRESH_OK = False
 
 if AUTOREFRESH_OK and is_market_open():
-    st_autorefresh(interval=15_000, limit=None, key="market_autorefresh")  # 每 15 秒刷新一次
+    st_autorefresh(interval=15_000, limit=None, key="market_autorefresh")
 elif not AUTOREFRESH_OK:
-    st.sidebar.warning("⚠️ 尚未安裝 streamlit-autorefresh，盤中不會自動更新。\n"
-                        "請執行：`pip install streamlit-autorefresh`")
+    st.sidebar.warning("⚠️ 尚未安裝 streamlit-autorefresh，盤中不會自動更新。請執行：pip install streamlit-autorefresh")
 
-# 格式化成交量顯示（大於1兆自動換算）
 def format_volume(yi):
     if yi is None:
         return "N/A"
@@ -59,28 +51,86 @@ def format_volume(yi):
     else:
         return f"{yi:,.2f} 億元"
 
-# === 證交所官方 API：抓「昨日/歷史」完整日成交金額（EOD 資料，每日收盤後更新一次）===
-@st.cache_data(ttl=60)
-def fetch_twse_market_turnover():
+# -------------------------
+# TWSE 官方 OpenAPI：取得全市場當日/歷史 EOD 類資料 (備援/參考)
+# Endpoint: https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL
+# 注意：OpenAPI 回傳欄位不一定固定，解析要做健壯處理
+# -------------------------
+OPENAPI_STOCK_DAY_ALL_URL = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"
+OPENAPI_UI_URL = "https://openapi.twse.com.tw/v1/ui/#/"
+
+@st.cache_data(ttl=60*60)  # 1 小時快取
+def fetch_twse_openapi_stock_day_all() -> Tuple[Any, str]:
     try:
-        url = "https://www.twse.com.tw/exchangeReport/FMTQIK?response=json"
-        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
-        res = requests.get(url, headers=headers, timeout=10)
+        url = OPENAPI_STOCK_DAY_ALL_URL
+        headers = {'User-Agent': 'Mozilla/5.0'}
+        res = requests.get(url, headers=headers, timeout=12)
+        res.raise_for_status()
         data = res.json()
-
-        if data.get('stat') == 'OK':
-            latest_row = data['data'][-1]
-            raw_amount_str = latest_row[2].replace(',', '')
-            turnover_yi = round(float(raw_amount_str) / 100000000.0, 2)
-            return turnover_yi, "Success"
-        else:
-            return None, "證交所 API 回傳狀態異常"
+        return data, "Success"
     except Exception as e:
-        return None, f"連線錯誤: {str(e)}"
+        return {}, f"OpenAPI 連線錯誤: {e}"
 
-# === 證交所首頁同款 API：summary.json 直接提供「盤中即時」大盤指數/漲跌/成交金額 ===
-# 免安裝 session、免 cookie，比 MIS API 簡單很多，且已實測確認欄位正確：
-#   TSE_I = 加權指數, TSE_D = 漲跌點數, TSE_P = 漲跌%, TSE_V = 當下累積成交金額(億元)
+def find_stock_in_openapi(all_data: Any, symbol: str) -> Tuple[Optional[float], Optional[Dict[str, Any]], Optional[str]]:
+    """
+    嘗試在 openapi 全市場資料中尋找股票 symbol（如 '0052'、'00830'、'00662'）。
+    回傳 (close_price 或 None, 原始 row 或 None, message 或 None)
+    message 用來說明解析過程中發生的情況（例如欄位名稱不符）。
+    """
+    if not all_data:
+        return None, None, "OpenAPI 無資料"
+    # openapi 端可能回傳 list 或 dict（需兼容）
+    rows = all_data if isinstance(all_data, list) else all_data.get("data") or all_data.get("items") or []
+    if not isinstance(rows, list):
+        return None, None, "OpenAPI 回傳格式非預期（非 list）"
+
+    # 標準化查詢代碼，ETFs 與股票在 openapi 上可能沒有前導零，先嘗試多種形式
+    symbol_z4 = symbol.zfill(4)
+    possible_codes = {symbol, symbol_z4}
+
+    # 常見欄位名稱集合
+    code_keys = ["Code", "code", "StockNo", "stockNo", "StockNo1", "stock_no", "股票代號", "證券代號"]
+    close_keys = ["Close", "close", "ClosePrice", "closePrice", "ClosePriceNew", "收盤價", "成交價"]
+
+    for row in rows:
+        # 找出 row 中任何可能的 code 欄位
+        row_code = None
+        for k in code_keys:
+            if k in row and row[k] is not None:
+                row_code = str(row[k]).strip()
+                break
+        if row_code is None:
+            # 有些 row 用其他 key，例如 'c' 或 'stock_id'
+            for k, v in row.items():
+                if isinstance(v, (str, int)) and str(v).isdigit():
+                    # 若該值看起來像代碼則檢查
+                    val = str(v).zfill(4)
+                    if val in possible_codes or str(v) in possible_codes:
+                        row_code = str(v)
+                        break
+        if row_code is None:
+            continue
+
+        # 對比
+        if row_code in possible_codes or row_code.zfill(4) in possible_codes:
+            # 找 close 價
+            for ck in close_keys:
+                if ck in row and row[ck] not in (None, "", "-"):
+                    try:
+                        return float(row[ck]), row, None
+                    except Exception:
+                        # 非數值形式，嘗試去除逗號再轉
+                        try:
+                            return float(str(row[ck]).replace(",", "")), row, None
+                        except Exception:
+                            return None, row, "找到對應代碼但收盤價欄位格式不可轉為數值"
+            # 未找到常見的 close 欄位，回傳 row 以便人工檢查
+            return None, row, "找到對應代碼但未找到已知的收盤價欄位"
+    return None, None, "OpenAPI 中找不到對應股票代號"
+
+# -------------------------
+# 證交所 summary.json（盤中即時大盤指數、當下累積成交金額）
+# -------------------------
 @st.cache_data(ttl=10)
 def fetch_twse_summary():
     try:
@@ -88,23 +138,26 @@ def fetch_twse_summary():
         ts = int(datetime.now().timestamp() * 1000)
         url = f"https://www.twse.com.tw/res/data/zh/home/summary.json?_={ts}"
         res = requests.get(url, headers=headers, timeout=8)
+        res.raise_for_status()
         data = res.json()
         return {
             "index": data.get("TSE_I"),
             "diff": data.get("TSE_D"),
             "pct": data.get("TSE_P"),
-            "turnover_yi": data.get("TSE_V"),  # 億元，盤中即時累積金額
+            "turnover_yi": data.get("TSE_V"),
             "time": data.get("SHTIME"),
         }, "Success"
     except Exception as e:
-        return {}, f"summary.json 連線錯誤: {str(e)}"
+        return {}, f"summary.json 連線錯誤: {e}"
 
-# === 證交所 MIS 即時報價 API：抓「盤中即時」的指數/個股價格、漲跌、成交量 ===
-# 免費、不需 API Key，官方資料來源，更新頻率可達秒級
-# 注意：這是未公開文件的 API（業界常用），欄位含義：
-#   z = 當盤成交價, y = 昨收價, v = 累積成交量(張), tv = 當盤成交量, d = 日期, t = 時間
+# -------------------------
+# MIS API：盤中即時個股/ETF 報價（主要）
+# Endpoint: https://mis.twse.com.tw/stock/api/getStockInfo.jsp
+# 呼叫時先打首頁拿 cookie，再合併多支在 ex_ch 一次取得以減少請求次數
+# 若回傳格式改變或缺少 msgArray，會回傳警示訊息與原始 JSON（供檢查）
+# -------------------------
 @st.cache_data(ttl=5)
-def fetch_realtime_quotes(code_map: dict):
+def fetch_realtime_quotes_mis(code_map: Dict[str, str]) -> Tuple[Dict[str, Any], str]:
     """
     code_map 範例: {"大盤": "t00", "0052": "0052", "00830": "00830", "00662": "00662"}
     回傳: (result_dict, msg)
@@ -112,21 +165,45 @@ def fetch_realtime_quotes(code_map: dict):
     headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
     try:
         session = requests.Session()
-        # 先打首頁拿 session cookie，避免直接呼叫 API 被擋
         session.get("https://mis.twse.com.tw/stock/index.jsp", headers=headers, timeout=5)
 
-        ex_ch = "|".join([f"tse_{code}.tw" for code in code_map.values()])
+        # 建構 ex_ch：使用 tse_{code}.tw 形式（包含 index 的 t00）
+        ex_ch_items = []
+        for code in code_map.values():
+            # 若 code 為 t00 (index)，保持 t00 的形式；community practice 是 tse_t00.tw 可用
+            ex_ch_items.append(f"tse_{code}.tw")
+        ex_ch = "|".join(ex_ch_items)
+
         ts = int(datetime.now().timestamp() * 1000)
         url = f"https://mis.twse.com.tw/stock/api/getStockInfo.jsp?ex_ch={ex_ch}&json=1&delay=0&_={ts}"
         res = session.get(url, headers=headers, timeout=8)
+        res.raise_for_status()
         data = res.json()
+
+        # 偵測結構是否異常
+        if "msgArray" not in data or not isinstance(data["msgArray"], list):
+            # 結構有變動，回傳原始 JSON 並提示使用者檢查
+            msg = "MIS API 回傳結構異常：缺少 msgArray 或型態改變。可能需要檢查 API 節點（https://mis.twse.com.tw/stock/index.jsp）或調整解析邏輯。"
+            st.sidebar.warning(msg)
+            st.sidebar.text("若需要，請檢查以下原始回應（僅供 debug）：")
+            st.sidebar.json(data)
+            return {}, msg
 
         code_to_name = {v: k for k, v in code_map.items()}
         result = {}
         for item in data.get("msgArray", []):
             code = item.get("c")
-            name = code_to_name.get(code)
+            # item 可能包含 'c' = code (like '0052'), 有時候為整數字串
+            name = code_to_name.get(code) or code_to_name.get(str(code).zfill(4))
             if not name:
+                # 有時回傳的 code 欄跟我們的 mapping 不一致，試著以 'n' (name) 去 match
+                n = item.get("n")
+                for k, v in code_map.items():
+                    if n and (str(n).find(k) != -1 or str(k).find(str(n)) != -1):
+                        name = k
+                        break
+            if not name:
+                # 跳過不在我們監控清單內的項目
                 continue
 
             def _to_float(s):
@@ -138,13 +215,12 @@ def fetch_realtime_quotes(code_map: dict):
             price = _to_float(item.get("z"))
             prev_close = _to_float(item.get("y"))
 
-            # 開盤前或無成交時 'z' 可能是 '-'，改用最佳買/賣價估計，都沒有才退回昨收
             if price is None:
                 bid = item.get("b", "").split("_")[0] if item.get("b") else ""
                 ask = item.get("a", "").split("_")[0] if item.get("a") else ""
                 price = _to_float(bid) or _to_float(ask) or prev_close
 
-            volume_lots = _to_float(item.get("v")) or 0  # 累積成交量(張)
+            volume_lots = _to_float(item.get("v")) or 0
 
             result[name] = {
                 "price": price,
@@ -152,18 +228,21 @@ def fetch_realtime_quotes(code_map: dict):
                 "volume_lots": volume_lots,
                 "time": item.get("t", "-"),
                 "date": item.get("d", "-"),
+                "raw": item  # 保留原始 item 以供 debug
             }
+
         if not result:
-            return {}, "MIS API 無回傳資料（可能非交易時間或被暫時限流）"
+            return {}, "MIS API 無回傳預期的監控標的資料（可能為非交易時間或被限流）"
         return result, "Success"
     except Exception as e:
-        return {}, f"即時報價連線錯誤: {str(e)}"
+        return {}, f"即時報價連線錯誤: {e}"
 
-# 自動推算預估量（用官方最新一日 EOD 金額，依盤中已過時間比例反推全天估計值）
+# -------------------------
+# 估算今日成交量（當 summary.json 不可得時，用昨日 EOD x 時間比例估算全天）
+# -------------------------
 def calculate_estimated_volume(current_vol):
     now = datetime.now(TW_TZ)
     current_time = now.time()
-
     market_start = datetime.strptime("09:00:00", "%H:%M:%S").time()
     market_end = datetime.strptime("13:30:00", "%H:%M:%S").time()
 
@@ -178,15 +257,19 @@ def calculate_estimated_volume(current_vol):
             return round(est_vol, 2)
         return current_vol
 
-# 畫專業 K 線圖的專用函數
+# -------------------------
+# 畫 K 線圖（專業）
+# -------------------------
 def draw_professional_chart(df, title_name):
+    df = df.copy()
     df['5MA'] = df['Close'].rolling(window=5).mean()
     df['10MA'] = df['Close'].rolling(window=10).mean()
     df['20MA'] = df['Close'].rolling(window=20).mean()
     df['120MA'] = df['Close'].rolling(window=120).mean()
     df['9VMin'] = df['Low'].rolling(window=9, min_periods=1).min()
     df['9VMax'] = df['High'].rolling(window=9, min_periods=1).max()
-    df['RSV'] = 100 * (df['Close'] - df['9VMin']) / (df['9VMax'] - df['9VMin'])
+    denom = (df['9VMax'] - df['9VMin']).replace(0, 1)
+    df['RSV'] = 100 * (df['Close'] - df['9VMin']) / denom
     df['K'] = df['RSV'].ewm(com=2, adjust=False).mean()
     df['D'] = df['K'].ewm(com=2, adjust=False).mean()
 
@@ -217,21 +300,27 @@ def draw_professional_chart(df, title_name):
     fig.update_xaxes(rangebreaks=[dict(bounds=["sat", "mon"])])
     return fig
 
-# === 主程式執行區 ===
+# -------------------------
+# 主程式
+# -------------------------
 tickers = {"大盤": "^TWII", "0052": "0052.TW", "00830": "00830.TW", "00662": "00662.TW"}
-# MIS 即時報價用的代碼（大盤指數代碼是 t00，其餘用股票代號）
+# MIS 的 code mapping（給 fetch_realtime_quotes_mis 使用）
 mis_codes = {"大盤": "t00", "0052": "0052", "00830": "00830", "00662": "00662"}
 
 prices, changes, history_dfs, ma20_now, ma20_prev = {}, {}, {}, {}, {}
 
 with st.spinner('正在同步證交所官方數據與最新報價...'):
-    real_twse_vol, api_msg = fetch_twse_market_turnover()      # EOD 官方日成交金額（備援/參考用）
-    twse_summary, summary_msg = fetch_twse_summary()            # ✅ 大盤即時指數/漲跌/成交金額（首選）
-    realtime_quotes, rt_msg = fetch_realtime_quotes(mis_codes)  # 個股/ETF 即時報價與成交量
+    # 1) 取得 OpenAPI 全市場資料（備援）
+    openapi_all, openapi_msg = fetch_twse_openapi_stock_day_all()
 
-    # 歷史日線資料（用來畫圖 / 算均線）：今天的即時價已經由 MIS API 負責，
-    # 所以這裡一天抓一次就夠，快取用「日期」當 key，同一天內不管刷新幾次都不會重打 yfinance。
-    @st.cache_data(ttl=6 * 60 * 60)  # 快取 6 小時，同一天內最多重抓幾次
+    # 2) 取得 summary.json（大盤當下即時指數與成交金額）
+    twse_summary, summary_msg = fetch_twse_summary()
+
+    # 3) 用 MIS API 取得個股/ETF 即時報價（主要來源）
+    realtime_quotes, rt_msg = fetch_realtime_quotes_mis(mis_codes)
+
+    # 4) 歷史日線資料 (yfinance)，用今天的日期當 key 做快取
+    @st.cache_data(ttl=6 * 60 * 60)
     def fetch_history(symbol, cache_date):
         last_err = None
         for attempt in range(3):
@@ -245,7 +334,7 @@ with st.spinner('正在同步證交所官方數據與最新報價...'):
                     return df
             except Exception as e:
                 last_err = e
-            time.sleep(1.5 * (attempt + 1))  # 指數退避，降低連續觸發限流的機率
+            time.sleep(1.5 * (attempt + 1))
         raise RuntimeError(f"yfinance 抓取 {symbol} 失敗（已重試3次）: {last_err}")
 
     today_str = datetime.now(TW_TZ).strftime("%Y-%m-%d")
@@ -254,7 +343,6 @@ with st.spinner('正在同步證交所官方數據與最新報價...'):
         try:
             df = fetch_history(symbol, today_str)
         except Exception as e:
-            # 失敗時退回 session_state 裡「上一次成功抓到」的舊資料，不讓整個 App 崩潰
             cache_key = f"last_good_history_{name}"
             if cache_key in st.session_state:
                 df = st.session_state[cache_key]
@@ -272,7 +360,6 @@ with st.spinner('正在同步證交所官方數據與最新報價...'):
         current_price, prev_close = None, None
 
         if name == "大盤" and twse_summary.get("index") is not None:
-            # ✅ 大盤優先用 summary.json（已實測驗證，最簡單穩定）
             current_price = twse_summary["index"]
             diff_amount = twse_summary["diff"]
             pct = twse_summary["pct"]
@@ -282,20 +369,37 @@ with st.spinner('正在同步證交所官方數據與最新報價...'):
         else:
             rt = realtime_quotes.get(name)
             if rt and rt.get("price") is not None and rt.get("prev_close") is not None:
-                # ✅ 個股/ETF 用 MIS 即時報價計算漲跌
                 current_price = rt["price"]
                 prev_close = rt["prev_close"]
                 prices[name] = round(current_price, 2)
                 diff_amount = current_price - prev_close
-                changes[name] = {"amount": diff_amount, "pct": (diff_amount / prev_close) * 100}
+                changes[name] = {"amount": diff_amount, "pct": (diff_amount / prev_close) * 100 if prev_close else 0.0}
             else:
-                # 備援：即時 API 都失敗時，退回原本用歷史資料算漲跌的方式
-                current_price = df['Close'].iloc[-1]
-                prices[name] = round(current_price, 2)
-                diff_amount = df['Close'].iloc[-1] - df['Close'].iloc[-2]
-                changes[name] = {"amount": diff_amount, "pct": (diff_amount / df['Close'].iloc[-2]) * 100}
+                # 若 MIS 沒資料，改用 OpenAPI 嘗試找最近的收盤價（備援）
+                fallback_price, matched_row, msg = find_stock_in_openapi(openapi_all, name)
+                if fallback_price is not None:
+                    current_price = fallback_price
+                    prices[name] = round(current_price, 2)
+                    # 若 yfinance 有昨天收盤價可用來算 delta
+                    try:
+                        diff_amount = current_price - df['Close'].iloc[-1]
+                        changes[name] = {"amount": diff_amount, "pct": (diff_amount / df['Close'].iloc[-1]) * 100}
+                    except Exception:
+                        changes[name] = {"amount": 0.0, "pct": 0.0}
+                else:
+                    # 若 openapi 也無，則使用 yfinance 的最後收盤價
+                    if msg:
+                        # 顯示較詳細的診斷訊息在側欄，並提供 openapi 的檢視連結
+                        st.sidebar.warning(f"⚠️ OpenAPI 解析提示: {msg}\n若欄位有調整，請至 {OPENAPI_UI_URL} 或 {OPENAPI_STOCK_DAY_ALL_URL} 查看原始欄位並更新解析器。")
+                        if matched_row is not None:
+                            st.sidebar.text("找到的 row（供 debug）：")
+                            st.sidebar.json(matched_row)
+                    current_price = df['Close'].iloc[-1]
+                    prices[name] = round(current_price, 2)
+                    diff_amount = df['Close'].iloc[-1] - df['Close'].iloc[-2]
+                    changes[name] = {"amount": diff_amount, "pct": (diff_amount / df['Close'].iloc[-2]) * 100}
 
-        # 盤中即時更新今天這根K棒，讓圖表也同步跳動
+        # 盤中同步今天的 K 棒 (若 history 最後一日為今天)
         today = datetime.now(TW_TZ).date()
         if current_price is not None and df.index[-1].date() == today:
             df.loc[df.index[-1], "Close"] = current_price
@@ -305,6 +409,7 @@ with st.spinner('正在同步證交所官方數據與最新報價...'):
         ma = df['Close'].rolling(window=20).mean()
         ma20_now[name], ma20_prev[name] = round(ma.iloc[-1], 2), round(ma.iloc[-2], 2)
 
+# 若所有資料齊全則畫面
 if len(prices) == 4:
     tw_df = history_dfs["大盤"]
 
@@ -315,8 +420,9 @@ if len(prices) == 4:
 
     if rt_msg != "Success":
         st.sidebar.warning(f"⚠️ 個股/ETF 即時報價 API 狀態：{rt_msg}\n目前漲跌%為備援計算（可能不即時）")
+        st.sidebar.info("若 MIS API 結構有變動，請檢查：https://mis.twse.com.tw/stock/index.jsp")
 
-    # === 側邊欄設定 ===
+    # 側邊參數
     st.sidebar.header("⚙️ 參數設定與盤中觀察")
     cost_52 = st.sidebar.number_input("0052 成本價", value=180.0, step=1.0)
     cost_830 = st.sidebar.number_input("00830 成本價", value=45.0, step=0.5)
@@ -332,18 +438,11 @@ if len(prices) == 4:
     use_auto_vol = st.sidebar.checkbox("自動抓取證交所官方成交量", value=True)
     if use_auto_vol:
         if twse_summary.get("turnover_yi") is not None:
-            # ✅ summary.json 盤中即時累積成交金額（不用再用「昨量×時間比例」估算）
             daily_volume = twse_summary["turnover_yi"]
-            st.sidebar.success(f"🟢 盤中即時成交金額: **{format_volume(daily_volume)}**\n"
-                                f"（更新時間 {twse_summary.get('time', '-')}）")
-        elif real_twse_vol is not None:
-            # 備援：summary.json 失敗時，退回昨日 EOD 量做估算
-            daily_volume = calculate_estimated_volume(real_twse_vol)
-            st.sidebar.warning(f"⚠️ 即時成交金額 API 失敗（{summary_msg}），改用估算值\n"
-                                f"🏛️ 官方前一日量: **{format_volume(real_twse_vol)}**\n"
-                                f"⏱️ 估算今日量: **{format_volume(daily_volume)}**")
+            st.sidebar.success(f"🟢 盤中即時成交金額: **{format_volume(daily_volume)}**（更新時間 {twse_summary.get('time', '-')})")
         else:
-            st.sidebar.error(f"API 讀取失敗: {api_msg}\n請改用手動輸入。")
+            st.sidebar.warning(f"⚠️ 即時成交金額 API 失敗（{summary_msg}），若 OpenAPI 有前一日 EOD 可用以估算，系統會採用估算值，否則請手動輸入。")
+            # 嘗試從 openapi_all 找到前一日整體成交金額 (視 endpoint 是否含此統計)
             daily_volume = st.sidebar.number_input("手動輸入今日成交金額 (億)", value=10835.69, step=50.0, format="%.2f")
     else:
         daily_volume = st.sidebar.number_input("手動輸入今日成交金額 (億)", value=10835.69, step=50.0, format="%.2f")
@@ -365,7 +464,7 @@ if len(prices) == 4:
     weeks_passed = st.sidebar.slider("距離起跌已過幾週？", 0, 8, 0)
     candle_shape = st.sidebar.selectbox("今日大盤 K 線型態", ["實體黑K", "實體紅K", "長下影線", "W底成型", "放量長紅"])
 
-    # === 圖表與數據面板 ===
+    # 圖表
     st.plotly_chart(draw_professional_chart(tw_df, "加權指數 (大盤)"), use_container_width=True)
 
     st.markdown("---")
@@ -379,12 +478,10 @@ if len(prices) == 4:
     st.caption(f"{'🔴 盤中即時更新中（每 15 秒自動刷新）' if is_market_open() else '⚪ 目前非交易時間，顯示為最後收盤資料'}")
     st.markdown("---")
 
-    # === 底部三關卡與 5 筆資金進場策略邏輯 ===
+    # 底部關卡邏輯
     worst_loss = min(loss_52, loss_830, loss_662)
-
     cond_volume_shrink = daily_volume <= 3500
     cond2 = cond_volume_shrink and stage2_no_new_low
-
     cond1 = (36000 <= prices["大盤"] <= 38000) or (worst_loss <= -15.0) or stage1_done
     cond3 = (3 <= weeks_passed <= 4)
     cond4 = (prices["大盤"] <= 41000) and (candle_shape in ["長下影線", "W底成型", "放量長紅"])
