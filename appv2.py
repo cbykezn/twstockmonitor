@@ -165,10 +165,11 @@ def analyze_kline_with_gemini(df_recent_json: str, api_key: str, date_str: str) 
         return f"❌ AI 設定發生錯誤：{str(e)}"
 
 # -------------------------
-# 官方證交所 API 區
+# 🏛️ 臺灣證券交易所 OpenAPI 專用區
 # -------------------------
 @st.cache_data(ttl=10)
 def fetch_twse_summary():
+    """ 抓取證交所官方即時大盤摘要 """
     try:
         headers = {'User-Agent': 'Mozilla/5.0'}
         ts = int(datetime.now().timestamp() * 1000)
@@ -182,6 +183,23 @@ def fetch_twse_summary():
             "pct": float(str(data.get("TSE_P", "0")).replace(",", "")),
             "turnover_yi": data.get("TSE_V"),
         }, "Success"
+    except Exception as e:
+        return {}, str(e)
+
+@st.cache_data(ttl=60)
+def fetch_twse_stock_day_all():
+    """ 抓取證交所官方每日所有股票與 ETF 收盤行情 (STOCK_DAY_ALL) """
+    try:
+        url = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"
+        res = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=10)
+        res.raise_for_status()
+        data = res.json()
+        result = {}
+        for item in data:
+            code = item.get("Code")
+            if code:
+                result[code] = item
+        return result, "Success"
     except Exception as e:
         return {}, str(e)
 
@@ -218,22 +236,6 @@ def fetch_twse_historical_turnover_20d():
         return avg_yi, "Success"
     except Exception as e:
         return 4500.0, f"Error: {e}"
-
-def fetch_fugle_intraday(symbol: str, token: str) -> Dict[str, Any]:
-    if not token: return {"error": "No token"}
-    clean_symbol = str(symbol).strip()
-    url = f"https://api.fugle.tw/marketdata/v1.0/stock/intraday/quote/{clean_symbol}"
-    try:
-        r = requests.get(url, headers={"X-API-KEY": token}, timeout=8)
-        if r.status_code != 200: return {"error": f"HTTP {r.status_code}"}
-        quote = r.json().get("data", r.json())
-        price = quote.get("closePrice") or quote.get("lastPrice") or quote.get("price") or quote.get("previousClose")
-        vol = quote.get("totalAmount") if clean_symbol == "IX0001" else (quote.get("totalVolume") or quote.get("volume"))
-        if price is not None:
-            return {"price": float(price), "volume": float(vol) if vol is not None else None, "raw": quote}
-        return {"error": "Parse error"}
-    except Exception as e:
-        return {"error": str(e)}
 
 # -------------------------
 # 指標與圖表
@@ -276,17 +278,11 @@ def draw_professional_chart(df, title_name):
 # -------------------------
 tickers = {"大盤": "^TWII", "0052": "0052.TW", "00830": "00830.TW", "00662": "00662.TW"}
 
-with st.spinner('正在同步證交所官方數據、計算指標與 AI 解析...'):
+with st.spinner('正在同步證交所官方 OpenAPI 數據、計算指標與 AI 解析...'):
     twse_summary, _ = fetch_twse_summary()
+    twse_stock_day, _ = fetch_twse_stock_day_all()
     twse_vol, _ = fetch_twse_market_turnover()
     twse_20d_avg, _ = fetch_twse_historical_turnover_20d()
-
-    realtime_quotes = {}
-    for key, fugle_sym in FUGLE_SYMBOL_MAP.items():
-        if key == "大盤": continue
-        fallback = fetch_fugle_intraday(fugle_sym, fugle_token) if fugle_token else {"error": "no token"}
-        if "error" not in fallback and fallback.get("price") is not None:
-            realtime_quotes[key] = {"price": fallback.get("price"), "volume": fallback.get("volume")}
 
     @st.cache_data(ttl=6 * 60 * 60)
     def fetch_history(symbol, cache_date):
@@ -303,15 +299,7 @@ with st.spinner('正在同步證交所官方數據、計算指標與 AI 解析..
         except Exception:
             continue
 
-        # 🌟 確保 yfinance 數據有足夠長度
-        if len(df) >= 2:
-            yf_close = float(df['Close'].iloc[-1])
-            yf_prev_close = float(df['Close'].iloc[-2])
-        else:
-            yf_close = float(df['Close'].iloc[-1]) if len(df) > 0 else 0.0
-            yf_prev_close = yf_close
-
-        # === 價格指派 (大盤用官方摘要，個股強制使用 yfinance 收盤價作為最穩健防線) ===
+        # === 🌟 價格與漲跌來源：大盤用證交所 Summary，個股/ETF 改抓證交所官方 STOCK_DAY_ALL OpenAPI ===
         if name == "大盤" and twse_summary.get("index") is not None:
             current_price = twse_summary["index"]
             diff_amount = twse_summary["diff"]
@@ -319,12 +307,29 @@ with st.spinner('正在同步證交所官方數據、計算指標與 AI 解析..
             prices[name] = round(current_price, 2)
             changes[name] = {"amount": diff_amount, "pct": pct}
         else:
-            # 個股強制以 yfinance 的最新收盤價為主，確保絕對不會 nan
-            current_price = yf_close
-            prices[name] = round(current_price, 2)
-            diff_amount = current_price - yf_prev_close
-            pct_val = (diff_amount / yf_prev_close) * 100 if yf_prev_close > 0 else 0.0
-            changes[name] = {"amount": round(diff_amount, 2), "pct": round(pct_val, 2)}
+            # 從證交所 STOCK_DAY_ALL 抓取對應代號 (例如 0052, 00830, 00662)
+            code_str = name # 剛好鍵名就是代號
+            stock_info = twse_stock_day.get(code_str, {})
+            
+            close_str = stock_info.get("ClosingPrice", "").replace(",", "")
+            change_str = stock_info.get("Change", "").replace(",", "")
+            
+            if close_str:
+                current_price = float(close_str)
+                diff_amount = float(change_str) if change_str else 0.0
+                prev_close = current_price - diff_amount
+                pct_val = (diff_amount / prev_close * 100) if prev_close > 0 else 0.0
+                
+                prices[name] = round(current_price, 2)
+                changes[name] = {"amount": round(diff_amount, 2), "pct": round(pct_val, 2)}
+            else:
+                # 最終安全防線 (若證交所 OpenAPI 暫時沒抓到)
+                current_price = float(df['Close'].iloc[-1])
+                prev_close = float(df['Close'].iloc[-2]) if len(df) >= 2 else current_price
+                diff_amount = current_price - prev_close
+                pct_val = (diff_amount / prev_close * 100) if prev_close > 0 else 0.0
+                prices[name] = round(current_price, 2)
+                changes[name] = {"amount": round(diff_amount, 2), "pct": round(pct_val, 2)}
 
         df = compute_indicators(df)
         history_dfs[name] = df
