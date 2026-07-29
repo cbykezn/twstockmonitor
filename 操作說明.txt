@@ -1,7 +1,0 @@
-執行輸入:
- streamlit run appv2.py
-
-關閉:
-點 terminal區，之後 ctrl+c 
-
-git:cbykezn
