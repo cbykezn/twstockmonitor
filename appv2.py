@@ -4,7 +4,7 @@ import json
 import time
 import threading
 import requests
-import websocket
+import traceback
 import streamlit as st
 import yfinance as yf
 import pandas as pd
@@ -13,9 +13,15 @@ from plotly.subplots import make_subplots
 from datetime import datetime, timezone, timedelta
 from typing import Tuple, Dict, Any, Optional, List
 
-# -------------------------
-# 設定 / 先嘗試 curl_cffi (yfinance session 模擬 chrome 指紋，可選)
-# -------------------------
+# websocket-client may not be available in some envs; import guarded
+try:
+    import websocket
+    WS_AVAILABLE = True
+except Exception:
+    websocket = None
+    WS_AVAILABLE = False
+
+# optional curl_cffi for yfinance session impersonation
 try:
     from curl_cffi import requests as cffi_requests
     YF_SESSION = cffi_requests.Session(impersonate="chrome")
@@ -36,11 +42,11 @@ def is_market_open():
     end = now.replace(hour=13, minute=30, second=0, microsecond=0)
     return start <= now <= end
 
-# 自動刷新 (盤中)
-AUTOREFRESH_OK = True
+# autorefresh
 try:
     from streamlit_autorefresh import st_autorefresh
-except ImportError:
+    AUTOREFRESH_OK = True
+except Exception:
     AUTOREFRESH_OK = False
 
 if AUTOREFRESH_OK and is_market_open():
@@ -58,19 +64,15 @@ def format_volume(yi):
         return f"{yi:,.2f} 億元"
 
 # -------------------------
-# 你的監控標的與 Fugle symbol 映射
-# 三支標的 (你提供的格式)
+# Fugle symbol mapping (your monitored symbols)
 # -------------------------
-# 我們在 app 內用簡短代碼作 key（"0052","00662","00830"）
 FUGLE_SYMBOL_MAP = {
-    "0052": "TW.0052",   # 富邦科技 (上市) -> 你給的範例 TW.0052
-    "00662": "TW.00662", # 富邦NASDAQ -> TW.00662
-    "00830": "TW.00830", # 國泰費城半導體 -> TW.00830
+    "0052": "TW.0052",
+    "00662": "TW.00662",
+    "00830": "TW.00830",
 }
 
-# -------------------------
-# Fugle WebSocket 即時資料 store (thread-safe)
-# -------------------------
+# thread-safe store for WS
 from threading import Lock
 _fugle_store = {"data": {}, "lock": Lock()}
 
@@ -83,24 +85,80 @@ def fugle_store_get_all() -> Dict[str, Dict[str, Any]]:
         return dict(_fugle_store["data"])
 
 # -------------------------
-# Fugle WebSocket client (背景 thread)
-# 注意：下方 ws_url / subscribe payload 依照 Fugle 實際文件調整
-# 我使用示範 endpoint: wss://realtime.fugle.tw/v0/streams/quote?token=...
-# 若 Fugle 指定其他 URL 或 subscribe 格式，請替換 run_loop 的 sub_msg 與 ws_url
+# Robust token detection (supports multiple secrets formats + env)
+# -------------------------
+def get_fugle_token_and_source():
+    token = None
+    source = None
+    secrets_keys = None
+    try:
+        secrets = st.secrets
+        try:
+            secrets_keys = list(secrets.keys())
+            if secrets_keys:
+                st.sidebar.info(f"st.secrets 目前含有頂層鍵: {', '.join(secrets_keys)}")
+            else:
+                st.sidebar.info("st.secrets 存在但為空。")
+        except Exception:
+            secrets_keys = None
+
+        if "FUGLE" in secrets:
+            val = secrets["FUGLE"]
+            if isinstance(val, dict):
+                for k in ("token", "accessToken", "access_token", "api_key", "apikey"):
+                    if k in val and val[k]:
+                        token = val[k]
+                        source = f"st.secrets['FUGLE']['{k}']"
+                        break
+            elif isinstance(val, str) and val.strip():
+                token = val.strip()
+                source = "st.secrets['FUGLE'] (string)"
+        if not token:
+            for k in ("FUGLE__token", "FUGLE_TOKEN", "FUGLE__TOKEN", "FUGLEKEY", "FUGLEKEY_TOKEN", "FUGLE"):
+                if k in secrets and isinstance(secrets[k], str) and secrets[k].strip():
+                    token = secrets[k].strip()
+                    source = f"st.secrets['{k}']"
+                    break
+        if not token and "token" in secrets and isinstance(secrets["token"], str) and secrets["token"].strip():
+            token = secrets["token"].strip()
+            source = "st.secrets['token']"
+    except Exception:
+        secrets_keys = None
+
+    if not token:
+        for env_key in ("FUGLE_TOKEN", "FUGLE__TOKEN", "FUGLE_API_KEY", "FUGLEKEY"):
+            val = os.environ.get(env_key)
+            if val:
+                token = val
+                source = f"env:{env_key}"
+                break
+
+    return token, source, secrets_keys
+
+fugle_token, fugle_token_source, fugle_secrets_keys = get_fugle_token_and_source()
+if fugle_token:
+    masked = (fugle_token[:4] + "..." + fugle_token[-4:]) if len(fugle_token) > 8 else "****"
+    st.sidebar.success(f"Fugle token 已載入（來源: {fugle_token_source}，{masked}）")
+else:
+    st.sidebar.error("Fugle token 未載入 — 請至 Streamlit Secrets 或設定環境變數 FUGLE_TOKEN，或使用 TOML 格式：[FUGLE] token = \"...\"")
+
+# -------------------------
+# Fugle WebSocket (background thread)
+# Note: WebSocket subscription payload may vary by Fugle; adjust if official spec differs.
 # -------------------------
 def start_fugle_ws(symbols: List[str], token: str):
+    if not WS_AVAILABLE:
+        st.sidebar.error("websocket-client 未安裝，請在 requirements.txt 加上 websocket-client 並重新部署。")
+        return None
     if not token:
-        st.sidebar.error("Fugle token 未設定，請參考側欄教學把 token 放到 Streamlit secrets。")
+        st.sidebar.warning("Fugle token 未設定，WebSocket 不會啟動。")
         return None
 
-    # 範例 WebSocket URL（請以 Fugle 官方文件為準）
     ws_url = f"wss://realtime.fugle.tw/v0/streams/quote?token={token}"
 
     def on_open(ws):
         print("Fugle WS opened")
-        # subscribe each symbol (payload 需依照 Fugle 文件調整)
-        # 這裡使用示範的 subscribe format:
-        # {"type":"subscribe", "symbol":"TW.0052"}
+        # Subscribe messages: adjust according to official WS spec if needed
         for s in symbols:
             try:
                 sub_msg = json.dumps({"type": "subscribe", "symbol": s})
@@ -110,11 +168,6 @@ def start_fugle_ws(symbols: List[str], token: str):
                 print("subscribe error", e)
 
     def _extract_value_from_msg(data: Dict[str, Any]) -> Tuple[Optional[float], Optional[float], Optional[str]]:
-        """
-        嘗試從不同可能的 message schema 中抽出 price, volume, time 字段。
-        返回 (price, volume, time_str)
-        """
-        # 常見欄位嘗試清單
         candidates_price = [
             lambda d: d.get("last"), lambda d: d.get("lastPrice"),
             lambda d: d.get("price"), lambda d: d.get("z"),
@@ -164,28 +217,21 @@ def start_fugle_ws(symbols: List[str], token: str):
         try:
             data = json.loads(message)
         except Exception:
-            # 無法 parse，顯示原始字串於側欄（僅第一次或有異常時）
             try:
-                st.sidebar.warning("收到無法解析的 Fugle WS 訊息，原始內容已顯示於側欄（供 debug）。")
+                st.sidebar.warning("收到無法解析的 Fugle WS 訊息（raw），側欄顯示以供 debug。")
                 st.sidebar.text(message)
             except Exception:
                 pass
             return
 
-        # 嘗試解析出 symbol（欄位名稱依 Fugle 可能為 symbol / s / instrumentId 等）
         sym = data.get("symbol") or data.get("s") or data.get("instrumentId") or data.get("id")
-        # 如果 symbol 包含 market prefix，例如 "TW.0052"，我們轉回短 key "0052"
         key = None
         if sym:
-            # 尋找對應的 key
             for k, v in FUGLE_SYMBOL_MAP.items():
                 if str(sym).upper() == v.upper() or str(sym).endswith(k):
                     key = k
                     break
-
-        # 若 message 直接夾帶 instrument details under nested nodes,嘗試檢查 data.get('data') etc.
         if not key:
-            # scan nested for known symbol
             def _search_for_symbol(obj):
                 if isinstance(obj, dict):
                     for kk, vv in obj.items():
@@ -202,30 +248,22 @@ def start_fugle_ws(symbols: List[str], token: str):
                 return None
             res = _search_for_symbol(data)
             if res:
-                # res is (found_key, found_value)
                 _, found_val = res
                 for k, v in FUGLE_SYMBOL_MAP.items():
                     if str(found_val).upper() == v.upper() or str(found_val).endswith(k):
                         key = k
                         break
 
-        # 解析出 price/volume/time
         price, volume, msg_time = _extract_value_from_msg(data)
         if not key:
-            # 如果沒找到 key，但 data 含有 instrument code, 顯示 debug
             st.sidebar.warning("Fugle WS 訊息中未識別到監控標的代碼 (symbol)，原始 JSON 如下：")
             st.sidebar.json(data)
             return
-
-        # 若 price 解析失敗，將 raw message 儲存並在側欄提醒
         if price is None and volume is None:
             st.sidebar.warning(f"Fugle WS 訊息解析失敗（{key}），請檢查 raw JSON (側欄)。")
             st.sidebar.json(data)
-            # 仍保留 raw
             fugle_store_set(key, {"raw": data, "time": msg_time})
             return
-
-        # 成功解析則寫入 store (key 使用短代碼，如 "0052")
         fugle_store_set(key, {"price": price, "volume": volume, "time": msg_time, "raw": data})
 
     def on_error(ws, error):
@@ -243,7 +281,6 @@ def start_fugle_ws(symbols: List[str], token: str):
             pass
 
     def run_loop():
-        # 持續重連
         while True:
             try:
                 ws = websocket.WebSocketApp(ws_url, on_open=on_open, on_message=on_message, on_error=on_error, on_close=on_close)
@@ -261,31 +298,95 @@ def start_fugle_ws(symbols: List[str], token: str):
     return t
 
 # -------------------------
-# Fugle REST 日內行情 fallback
-# 注意：請以 Fugle API 文件為準調整 endpoint、headers、params
-# 我用示範 endpoint: https://api.fugle.tw/realtime/v0/intraday?symbol=TW.0052
+# Fugle meta lookup: find numeric symbolId (cached)
 # -------------------------
-def fetch_fugle_intraday(symbol: str, token: str) -> Dict[str, Any]:
-    """
-    使用 Fugle 正式 intraday quote endpoint (v0.3)。
-    - symbol: e.g. 'TW.0052'
-    - token: API token (會放在 X-API-KEY header)
-    回傳: {"price":..., "volume":..., "raw":...} 或 {"error": "..."}
-    """
+@st.cache_data(ttl=60 * 10)
+def fetch_fugle_symbol_meta(code_or_symbol: str, token: str) -> Tuple[Optional[int], Optional[Dict[str, Any]]]:
+    if not token:
+        return None, None
+    headers = {"X-API-KEY": token}
+    try:
+        s = code_or_symbol.strip()
+        # If looks numeric, try symbolId param
+        if s.isdigit():
+            url = "https://api.fugle.tw/marketdata/v1.0/meta/symbols"
+            params = {"symbolId": s}
+            r = requests.get(url, headers=headers, params=params, timeout=8)
+            if r.status_code == 200:
+                js = r.json()
+                data = js.get("data") or js
+                if isinstance(data, list) and data:
+                    item = data[0]
+                    try:
+                        return int(item.get("symbolId")), item
+                    except Exception:
+                        sid = item.get("symbolId")
+                        if isinstance(sid, str) and sid.isdigit():
+                            return int(sid), item
+                if isinstance(data, dict) and data.get("symbolId"):
+                    return int(data.get("symbolId")), data
+
+        # Fallback: fuzzy query 'q'
+        cand = []
+        if s.upper().startswith("TW."):
+            cand.append(s)
+            cand.append(s.split(".", 1)[1])
+        else:
+            cand.append(s)
+            cand.append("TW." + s)
+        url = "https://api.fugle.tw/marketdata/v1.0/meta/symbols"
+        for q in cand:
+            params = {"q": q}
+            r = requests.get(url, headers=headers, params=params, timeout=8)
+            if r.status_code != 200:
+                continue
+            js = r.json()
+            arr = js.get("data") or js.get("result") or js
+            if isinstance(arr, list) and arr:
+                item = arr[0]
+                sid = item.get("symbolId")
+                if isinstance(sid, (int, float)):
+                    return int(sid), item
+                if isinstance(sid, str) and sid.isdigit():
+                    return int(sid), item
+        try:
+            st.sidebar.warning(f"Fugle symbol meta 未找到: {code_or_symbol}（嘗試過：{cand}）")
+        except Exception:
+            pass
+        return None, None
+    except Exception as e:
+        try:
+            st.sidebar.error(f"fetch_fugle_symbol_meta 例外: {e}")
+        except Exception:
+            pass
+        return None, None
+
+# -------------------------
+# Fugle intraday using numeric symbolId (with meta lookup if needed)
+# -------------------------
+def fetch_fugle_intraday(symbol_or_code: str, token: str) -> Dict[str, Any]:
     if not token:
         return {"error": "Fugle token not set"}
-    url = "https://api.fugle.tw/realtime/v0.3/intraday/quote"
     headers = {"X-API-KEY": token}
-    params = {"symbolId": symbol}
-
     try:
+        s = str(symbol_or_code).strip()
+        if s.isdigit():
+            symbol_id_numeric = int(s)
+        else:
+            meta_id, meta_raw = fetch_fugle_symbol_meta(s, token)
+            if meta_id:
+                symbol_id_numeric = meta_id
+            else:
+                return {"error": f"Cannot find Fugle symbolId for {symbol_or_code}"}
+
+        url = "https://api.fugle.tw/realtime/v0.3/intraday/quote"
+        params = {"symbolId": symbol_id_numeric}
         r = requests.get(url, headers=headers, params=params, timeout=8)
         try:
             r.raise_for_status()
         except requests.HTTPError as he:
-            # 顯示 server 回應內容於側欄方便 debug
             try:
-                st.sidebar.error(f"Fugle REST HTTP {r.status_code} for {symbol}. See raw response below.")
+                st.sidebar.error(f"Fugle intraday HTTP {r.status_code} for symbolId={symbol_id_numeric}")
                 try:
                     st.sidebar.json(r.json())
                 except Exception:
@@ -296,17 +397,12 @@ def fetch_fugle_intraday(symbol: str, token: str) -> Dict[str, Any]:
 
         data = r.json()
         container = data.get("data") or data.get("result") or data
-
-        # 嘗試解析 price / volume（針對常見欄位）
         price = None
         volume = None
-
         if isinstance(container, dict):
-            # 常見位置： container['quote']['lastPrice'] 或 container['lastPrice'] 等
             quote = container.get("quote") if isinstance(container.get("quote"), dict) else container
             price = quote.get("lastPrice") or quote.get("last") or container.get("lastPrice") or container.get("last")
             volume = quote.get("volume") or container.get("volume") or container.get("totalVolume")
-            # fallback 深度搜尋數值
             if price is None:
                 def _deep_find_number(obj):
                     if isinstance(obj, dict):
@@ -328,7 +424,6 @@ def fetch_fugle_intraday(symbol: str, token: str) -> Dict[str, Any]:
                     return None
                 price = _deep_find_number(container)
         else:
-            # list or other structures: fallback deep find
             def _deep_find_number(obj):
                 if isinstance(obj, dict):
                     for v in obj.values():
@@ -351,21 +446,18 @@ def fetch_fugle_intraday(symbol: str, token: str) -> Dict[str, Any]:
 
         return {"price": float(price) if price is not None else None,
                 "volume": float(volume) if volume is not None else None,
-                "raw": data}
+                "raw": data, "symbolId": symbol_id_numeric}
     except Exception as e:
         try:
-            st.sidebar.error(f"Fugle REST request exception for {symbol}: {e}")
+            st.sidebar.error(f"fetch_fugle_intraday exception: {e}")
         except Exception:
             pass
         return {"error": str(e)}
 
 # -------------------------
-# (保留) TWSE OpenAPI / MIS API / yfinance 等備援邏輯（你原本的程式）
-# 我把主要呼叫點改成先讀 Fugle store，再 fallback to Fugle REST，再 fallback to MIS/OpenAPI/yfinance
-# 為簡潔起見，下方僅保留主要函數（若你想要完整保留舊版函數我可再加入）
+# TWSE OpenAPI and summary (kept as backup)
 # -------------------------
 OPENAPI_STOCK_DAY_ALL_URL = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"
-OPENAPI_UI_URL = "https://openapi.twse.com.tw/v1/ui/#/"
 
 @st.cache_data(ttl=60*60)
 def fetch_twse_openapi_stock_day_all() -> Tuple[Any, str]:
@@ -396,14 +488,8 @@ def fetch_twse_summary():
     except Exception as e:
         return {}, f"summary.json 連線錯誤: {e}"
 
-# (保留) MIS API 函數 (如要保留完整請將原本 fetch_realtime_quotes_mis 複製回來)
-@st.cache_data(ttl=5)
-def fetch_realtime_quotes_mis_placeholder(code_map: Dict[str, str]) -> Tuple[Dict[str, Any], str]:
-    # placeholder: 若 Fugle 與 fallback 都不可用，可在此調用 MIS API（原程式的實作）
-    return {}, "MIS placeholder - 未啟用"
-
 # -------------------------
-# K 線圖 & 其餘 UI 與邏輯 (維持你原本設計)
+# K-line drawing (kept)
 # -------------------------
 def draw_professional_chart(df, title_name):
     df = df.copy()
@@ -436,46 +522,34 @@ def draw_professional_chart(df, title_name):
     return fig
 
 # -------------------------
-# 主程式執行區（整合 Fugle as primary）
+# Main: start WS and perform data assembly
 # -------------------------
 tickers = {"大盤": "^TWII", "0052": "0052.TW", "00830": "00830.TW", "00662": "00662.TW"}
 
-# 啟動 Fugle WS（僅起一次）
-fugle_token = None
-# 讀取 token：優先 st.secrets，再 fallback environment variable
-if "FUGLE" in st.secrets and "token" in st.secrets["FUGLE"]:
-    fugle_token = st.secrets["FUGLE"]["token"]
-else:
-    fugle_token = os.environ.get("FUGLE_TOKEN")
-
+# start WS once
 if "fugle_ws_started" not in st.session_state:
     st.session_state["fugle_ws_started"] = False
 
 if not st.session_state["fugle_ws_started"]:
-    # start websocket thread
-    symbols_to_sub = list(FUGLE_SYMBOL_MAP.values())
-    if fugle_token:
+    if fugle_token and WS_AVAILABLE:
+        symbols_to_sub = list(FUGLE_SYMBOL_MAP.values())
         start_fugle_ws(symbols_to_sub, fugle_token)
         st.session_state["fugle_ws_started"] = True
         st.sidebar.info("🔌 Fugle WebSocket 背景連線已啟動（若側欄無錯誤，表示連線正常）。")
+    elif fugle_token and not WS_AVAILABLE:
+        st.sidebar.warning("Fugle token 有設定，但 websocket-client 未安裝，無法啟動 WS。請安裝並重新部署。")
     else:
-        st.sidebar.warning("Fugle token 未設定，請依側欄教學把 token 放入 Streamlit secrets 或環境變數 FUGLE_TOKEN。")
+        st.sidebar.warning("Fugle token 未設定，請在 Secrets 或 environment 設定。")
 
-# 後續主要使用 Fugle store 的資料；若缺某支，會呼叫 Fugle REST fallback，若 REST 也失敗則使用原先備援
 with st.spinner('正在同步證交所官方數據、Fugle 即時數據與最新報價...'):
-    # 取得 OpenAPI & summary (備援)
     openapi_all, openapi_msg = fetch_twse_openapi_stock_day_all()
     twse_summary, summary_msg = fetch_twse_summary()
 
-    # 先從 Fugle store 取得目前資料快照
     fugle_snapshot = fugle_store_get_all()
 
-    # 若缺任一標的或資料太舊，使用 Fugle REST fallback 拉一次
-    current_time = datetime.now(TW_TZ)
     realtime_quotes = {}
     for key, fugle_sym in FUGLE_SYMBOL_MAP.items():
         entry = fugle_snapshot.get(key)
-        # check freshness (若 entry 有 time，可自行判斷是否過舊，這裡簡單檢查存在性)
         if entry and (entry.get("price") is not None):
             realtime_quotes[key] = {
                 "price": entry.get("price"),
@@ -485,21 +559,18 @@ with st.spinner('正在同步證交所官方數據、Fugle 即時數據與最新
                 "raw": entry.get("raw")
             }
         else:
-            # 走 Fugle REST fallback（注意速率限制：60/min，三支輪詢通常安全）
+            # fallback to Fugle REST intraday (will perform meta lookup internally)
             fallback = fetch_fugle_intraday(fugle_sym, fugle_token) if fugle_token else {"error": "no token"}
             if "error" in fallback:
-                # 若 Fugle REST 也失敗，保留空，由後續 OpenAPI / MIS / yfinance 備援處理
                 realtime_quotes[key] = {}
                 st.sidebar.warning(f"Fugle fallback 失敗 ({key}): {fallback.get('error')}")
             else:
-                # store and map to expected schema (price, prev_close, volume_lots)
                 price = fallback.get("price")
                 vol = fallback.get("volume")
                 realtime_quotes[key] = {"price": price, "prev_close": None, "volume_lots": vol, "time": None, "raw": fallback.get("raw")}
-                # 同步 update fugle_store
                 fugle_store_set(key, {"price": price, "volume": vol, "time": None, "raw": fallback.get("raw")})
 
-    # 以下保留你原本的歷史 yfinance 與備援邏輯 (fetch_history 等)
+    # fetch yfinance history (cached)
     @st.cache_data(ttl=6 * 60 * 60)
     def fetch_history(symbol, cache_date):
         last_err = None
@@ -547,9 +618,7 @@ with st.spinner('正在同步證交所官方數據、Fugle 即時數據與最新
             changes[name] = {"amount": diff_amount, "pct": pct}
             prev_close = current_price - diff_amount
         else:
-            # key mapping: our fugle keys are "0052","00830","00662"
-            short_key = name if name in FUGLE_SYMBOL_MAP else None
-            rt = realtime_quotes.get(short_key)
+            rt = realtime_quotes.get(name)
             if rt and rt.get("price") is not None:
                 current_price = rt["price"]
                 prev_close = rt.get("prev_close") if rt.get("prev_close") not in (None, 0) else None
@@ -558,24 +627,19 @@ with st.spinner('正在同步證交所官方數據、Fugle 即時數據與最新
                     diff_amount = current_price - prev_close
                     changes[name] = {"amount": diff_amount, "pct": (diff_amount / prev_close) * 100}
                 else:
-                    # 若沒有 prev_close，使用 yfinance 前一收盤估算
                     try:
                         diff_amount = current_price - df['Close'].iloc[-1]
                         changes[name] = {"amount": diff_amount, "pct": (diff_amount / df['Close'].iloc[-1]) * 100}
                     except Exception:
                         changes[name] = {"amount": 0.0, "pct": 0.0}
             else:
-                # Fugle (WS & REST) 都沒有 -> fallback to OpenAPI or yfinance
-                # 嘗試在 openapi 找到收盤價
+                # fallback to openapi / yfinance last close
                 fallback_price = None
                 try:
-                    # 嘗試 find_stock_in_openapi 相似的快速查找（簡化）
                     oa = openapi_all if isinstance(openapi_all, list) else openapi_all.get("data", [])
                     for row in oa:
-                        # 根據資料行 (可能是 list 或 dict)，做最基本的字串搜查
                         if isinstance(row, (list, tuple)):
                             if any(str(cell).endswith(name) for cell in row if cell is not None):
-                                # 找到就採用最後一個數值欄位為估計收盤
                                 for cell in reversed(row):
                                     try:
                                         cand = float(str(cell).replace(",", ""))
@@ -586,9 +650,7 @@ with st.spinner('正在同步證交所官方數據、Fugle 即時數據與最新
                                 if fallback_price:
                                     break
                         elif isinstance(row, dict):
-                            # 找到可能的 Code 欄
                             if any(str(v).endswith(name) for v in row.values() if v):
-                                # 優先找 close keys
                                 for ck in ("Close", "close", "ClosePrice", "closePrice", "成交價", "收盤價"):
                                     if ck in row and row[ck] not in (None, "", "-"):
                                         try:
@@ -613,7 +675,6 @@ with st.spinner('正在同步證交所官方數據、Fugle 即時數據與最新
                     diff_amount = df['Close'].iloc[-1] - df['Close'].iloc[-2]
                     changes[name] = {"amount": diff_amount, "pct": (diff_amount / df['Close'].iloc[-2]) * 100}
 
-        # 若當天 K 棒存在，更新當日 Close/High/Low 以利即時圖表顯示
         today = datetime.now(TW_TZ).date()
         if current_price is not None and df.index[-1].date() == today:
             df.loc[df.index[-1], "Close"] = current_price
@@ -623,7 +684,7 @@ with st.spinner('正在同步證交所官方數據、Fugle 即時數據與最新
         ma = df['Close'].rolling(window=20).mean()
         ma20_now[name], ma20_prev[name] = round(ma.iloc[-1], 2), round(ma.iloc[-2], 2)
 
-    # 畫表與 UI（維持你原本的展示）
+    # render UI (same structure as before)
     if len(prices) == 4:
         tw_df = history_dfs["大盤"]
         if summary_msg == "Success":
@@ -644,6 +705,7 @@ with st.spinner('正在同步證交所官方數據、Fugle 即時數據與最新
         st.markdown("---")
 
         col1, col2, col3, col4 = st.columns(4)
+        # default daily_volume fallback manual entry (user can override)
         daily_volume = st.sidebar.number_input("手動輸入今日成交金額 (億)", value=10835.69, step=50.0, format="%.2f")
         vol_text = f"今日成交: {format_volume(daily_volume)}"
 
@@ -654,7 +716,48 @@ with st.spinner('正在同步證交所官方數據、Fugle 即時數據與最新
 
         st.caption(f"{'🔴 盤中即時更新中（以 Fugle WebSocket 為主）' if is_market_open() else '⚪ 目前非交易時間，顯示為最後收盤資料'}")
         st.markdown("---")
-        # ... (下方保留原始的五筆策略與顯示邏輯) ...
-        # (為簡潔，略去重複顯示部分，可將你原始的渲染區塊拷回來)
+
+        # bottom strategy cards (kept simple)
+        worst_loss = min(loss_52, loss_830, loss_662)
+        cond_volume_shrink = daily_volume <= 3500
+        stage1_done = st.sidebar.checkbox("✅ 第一關：已完成巨量換手 (如見1兆以上)", value=True)
+        stage2_no_new_low = st.sidebar.checkbox("⏳ 第二關條件A：指數近期沒有再創新低", value=False)
+        stage3_breakout = st.sidebar.checkbox("⏳ 第三關：已站回 5/10MA 或放量長紅", value=False)
+        weeks_passed = st.sidebar.slider("距離起跌已過幾週？", 0, 8, 0)
+        candle_shape = st.sidebar.selectbox("今日大盤 K 線型態", ["實體黑K", "實體紅K", "長下影線", "W底成型", "放量長紅"])
+
+        cond2 = cond_volume_shrink and stage2_no_new_low
+        cond1 = (36000 <= prices["大盤"] <= 38000) or (worst_loss <= -15.0) or stage1_done
+        cond3 = (3 <= weeks_passed <= 4)
+        cond4 = (prices["大盤"] <= 41000) and (candle_shape in ["長下影線", "W底成型", "放量長紅"])
+        cond5 = (all(prices[name] > ma20_now[name] for name in tickers) and all(ma20_now[name] > ma20_prev[name] for name in tickers)) or stage3_breakout
+
+        st.subheader("🎯 底部三關卡與五筆資金進場監測")
+        st.markdown(f"""
+        > **📊 目前量能結構狀態解析**：
+        > * **第一關（大量換手）**：{'✅ 已達成（見 1.08 兆巨量）' if stage1_done else '⏳ 觀察中'}
+        > * **第二關（惜售量縮 / 窒息量）**：{'✅ 已達成' if cond2 else f'⏳ 評估中（目前成交量: {format_volume(daily_volume)}，待後續量縮至 3500 億以下且不破底）'}
+        > * **第三關（均線與反攻）**：{'✅ 已確認反攻' if cond5 else '⏳ 等待站回 5/10MA 或放量長紅'}
+        """)
+        st.markdown("---")
+
+        def render_card(col, title, condition, success_msg, fail_msg):
+            with col:
+                if condition: st.success(f"### 🟢 第 {title} 筆\n\n{success_msg}")
+                else: st.error(f"### 🔴 鎖定中\n**第 {title} 筆**\n\n{fail_msg}")
+
+        c1, c2, c3, c4, c5 = st.columns(5)
+        render_card(c1, "1. 第一關-換手", cond1, f"巨量換手完成！\n成交: {format_volume(daily_volume)}", f"等待巨量換手確認\n大盤: {prices['大盤']:,.0f}")
+        render_card(c2, "2. 第二關-窒息", cond2, f"量縮惜售，賣壓枯竭！\n成交量: {format_volume(daily_volume)}", f"目前成交量: {format_volume(daily_volume)}\n未創新低: {'是' if stage2_no_new_low else '否'}")
+        render_card(c3, "3. 時間折磨", cond3, f"盤整期滿，時間滿足！\n已過 {weeks_passed} 週", f"已過 {weeks_passed} 週（目標 3-4 週）")
+        render_card(c4, "4. 型態確認", cond4, f"第二隻腳打底完成！\n目前型態: {candle_shape}", f"目前型態: {candle_shape}")
+        render_card(c5, "5. 第三關-反攻", cond5, f"均線共振 / 放量長紅，右側反攻！", f"等待站回 5/10MA 或放量")
+
+        st.markdown("---")
+        triggered_count = sum([cond1, cond2, cond3, cond4, cond5])
+        if triggered_count > 0:
+            st.info(f"🚨 **執行紀律：已有 {triggered_count} 筆資金達成觸發條件。請無視市場雜音，冷酷執行對應部位的進場！**")
+        else:
+            st.warning("☕ **空手觀望：目前尚無任何一筆資金觸發條件。保單借款利息是你買「從容」的成本，請耐心等待。**")
     else:
         st.error("資料讀取不完整，請稍後重新整理頁面。")
