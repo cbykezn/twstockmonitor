@@ -7,7 +7,7 @@ from plotly.subplots import make_subplots
 import requests
 import time
 from datetime import datetime, timezone, timedelta
-from typing import Tuple, Dict, Any, Optional
+from typing import Tuple, Dict, Any, Optional, List
 
 # 嘗試用 curl_cffi 讓 yfinance 的 session 模擬 Chrome TLS 指紋 (可選)
 try:
@@ -16,7 +16,7 @@ try:
 except Exception:
     YF_SESSION = None
 
-st.set_page_config(page_title="台股進場數據觀測", layout="wide")
+st.set_page_config(page_title="台股抄底觀測站", layout="wide")
 st.title("🎯 台股五大關鍵底部觀測面板")
 st.markdown("---")
 
@@ -71,62 +71,174 @@ def fetch_twse_openapi_stock_day_all() -> Tuple[Any, str]:
     except Exception as e:
         return {}, f"OpenAPI 連線錯誤: {e}"
 
+def _extract_primitive(value):
+    """遞迴取得第一個原始值（str/int/float），供解析 nested 值使用。"""
+    if value is None:
+        return None
+    if isinstance(value, (str, int, float)):
+        return value
+    if isinstance(value, list):
+        for v in value:
+            p = _extract_primitive(v)
+            if p is not None:
+                return p
+        return None
+    if isinstance(value, dict):
+        for v in value.values():
+            p = _extract_primitive(v)
+            if p is not None:
+                return p
+        return None
+    return str(value)
+
+def _row_to_dict(maybe_row: Any, fields: Optional[List[str]] = None) -> Dict[str, Any]:
+    """
+    將可能是 list 或 dict 的 row 轉為 dict。
+    - 如果 row 是 list 且有 fields，則 zip(fields, row)
+    - 如果 row 是 dict，遞迴取出可用的原始值
+    """
+    if isinstance(maybe_row, list):
+        if fields:
+            return {k: _extract_primitive(v) for k, v in zip(fields, maybe_row)}
+        else:
+            # 把 list 轉為 index-keyed dict
+            return {str(i): _extract_primitive(v) for i, v in enumerate(maybe_row)}
+    if isinstance(maybe_row, dict):
+        return {k: _extract_primitive(v) for k, v in maybe_row.items()}
+    return {}
+
 def find_stock_in_openapi(all_data: Any, symbol: str) -> Tuple[Optional[float], Optional[Dict[str, Any]], Optional[str]]:
     """
     嘗試在 openapi 全市場資料中尋找股票 symbol（如 '0052'、'00830'、'00662'）。
+    支援多種回傳格式：
+      - list[dict]
+      - dict with 'data' and 'fields' -> data: list[list]
+      - dict with 'data' : list[dict]
     回傳 (close_price 或 None, 原始 row 或 None, message 或 None)
-    message 用來說明解析過程中發生的情況（例如欄位名稱不符）。
     """
     if not all_data:
         return None, None, "OpenAPI 無資料"
-    # openapi 端可能回傳 list 或 dict（需兼容）
-    rows = all_data if isinstance(all_data, list) else all_data.get("data") or all_data.get("items") or []
-    if not isinstance(rows, list):
-        return None, None, "OpenAPI 回傳格式非預期（非 list）"
 
-    # 標準化查詢代碼，ETFs 與股票在 openapi 上可能沒有前導零，先嘗試多種形式
+    # 支援：若 top-level 是 dict 且含 'fields'/'data' 結構
+    rows = None
+    fields = None
+    if isinstance(all_data, dict):
+        # 常見結構: {"fields": [...], "data": [[...], ...]}
+        if 'data' in all_data and isinstance(all_data['data'], list):
+            rows = all_data['data']
+            fields = all_data.get('fields')
+        elif 'items' in all_data and isinstance(all_data['items'], list):
+            rows = all_data['items']
+        elif isinstance(all_data.get('result'), list):
+            rows = all_data.get('result')
+        elif isinstance(all_data.get('dataList'), list):
+            rows = all_data.get('dataList')
+        elif isinstance(all_data.get('rows'), list):
+            rows = all_data.get('rows')
+        else:
+            # 可能是直接 dict mapping stock -> details
+            # 例如 {"2330": {...}, "2317": {...}}
+            potential = []
+            for k, v in all_data.items():
+                if isinstance(k, str) and k.isdigit() and isinstance(v, (dict, list)):
+                    potential.append({k: v})
+            if potential:
+                # flatten into rows list of dicts with code key
+                flat_rows = []
+                for item in potential:
+                    for code, payload in item.items():
+                        d = _row_to_dict(payload)
+                        # attach code as a field if not present
+                        if not any(str(_extract_primitive(val)) == code for val in d.values()):
+                            d['_code_from_key'] = code
+                        flat_rows.append(d)
+                rows = flat_rows
+
+    if rows is None:
+        # top-level is likely list
+        if isinstance(all_data, list):
+            rows = all_data
+        else:
+            return None, None, "OpenAPI 回傳格式非預期（top-level 不是 list 也沒有 data/fields）"
+
+    # 現在 rows 可能是 list[list] 或 list[dict]
+    # 先嘗試把 rows 正規化為 list[dict]
+    norm_rows = []
+    sample_keys = set()
+    for r in rows:
+        rd = _row_to_dict(r, fields=fields)
+        if isinstance(rd, dict):
+            norm_rows.append(rd)
+            sample_keys.update(rd.keys())
+
+    if not norm_rows:
+        return None, None, "OpenAPI 資料解析後沒有可用列"
+
+    # 準備可能匹配的 code 形式
+    symbol_clean = symbol.lstrip("0") if symbol.lstrip("0") != "" else symbol  # '0052' -> '52'
     symbol_z4 = symbol.zfill(4)
-    possible_codes = {symbol, symbol_z4}
+    possible_codes = {symbol, symbol_z4, symbol_clean, symbol.lstrip("0"), symbol.zfill(3), symbol.zfill(5)}
 
-    # 常見欄位名稱集合
-    code_keys = ["Code", "code", "StockNo", "stockNo", "StockNo1", "stock_no", "股票代號", "證券代號"]
-    close_keys = ["Close", "close", "ClosePrice", "closePrice", "ClosePriceNew", "收盤價", "成交價"]
+    # 常見欄位名稱集合（更完整）
+    code_keys = ["Code", "code", "StockNo", "stockNo", "StockNo1", "stock_no", "股票代號", "證券代號", "stock_id", "StockID", "stockNo1", "_code_from_key"]
+    close_keys = [
+        "Close", "close", "ClosePrice", "closePrice", "ClosePriceNew", "close_price", "CLOSE", "收盤價", "成交價",
+        "Close_Value", "ClosingPrice", "closingPrice", "price", "last", "LastPrice", "收盤"
+    ]
 
-    for row in rows:
-        # 找出 row 中任何可能的 code 欄位
-        row_code = None
+    # 嘗試每一列找 code
+    for row in norm_rows:
+        # collect all potential code-like values in row
+        row_codes = set()
         for k in code_keys:
-            if k in row and row[k] is not None:
-                row_code = str(row[k]).strip()
+            if k in row and row[k] not in (None, "", "-"):
+                row_codes.add(str(row[k]).strip())
+        # also scan all values for digits-only tokens
+        for v in row.values():
+            if isinstance(v, (str, int)) and str(v).strip().isdigit():
+                row_codes.add(str(v).strip())
+
+        matched = False
+        for rc in row_codes:
+            # compare after zero-fill
+            rc_z4 = rc.zfill(4)
+            if rc in possible_codes or rc_z4 in possible_codes:
+                matched = True
                 break
-        if row_code is None:
-            # 有些 row 用其他 key，例如 'c' 或 'stock_id'
-            for k, v in row.items():
-                if isinstance(v, (str, int)) and str(v).isdigit():
-                    # 若該值看起來像代碼則檢查
-                    val = str(v).zfill(4)
-                    if val in possible_codes or str(v) in possible_codes:
-                        row_code = str(v)
-                        break
-        if row_code is None:
+        if not matched:
             continue
 
-        # 對比
-        if row_code in possible_codes or row_code.zfill(4) in possible_codes:
-            # 找 close 價
-            for ck in close_keys:
-                if ck in row and row[ck] not in (None, "", "-"):
+        # 若 match，嘗試找收盤價
+        for ck in close_keys:
+            if ck in row and row[ck] not in (None, "", "-"):
+                val = row[ck]
+                try:
+                    return float(str(val).replace(",", "")), row, None
+                except Exception:
+                    # fallback: try extract primitive deeper
+                    prim = _extract_primitive(val)
                     try:
-                        return float(row[ck]), row, None
+                        if prim is not None:
+                            return float(str(prim).replace(",", "")), row, None
                     except Exception:
-                        # 非數值形式，嘗試去除逗號再轉
-                        try:
-                            return float(str(row[ck]).replace(",", "")), row, None
-                        except Exception:
-                            return None, row, "找到對應代碼但收盤價欄位格式不可轉為數值"
-            # 未找到常見的 close 欄位，回傳 row 以便人工檢查
-            return None, row, "找到對應代碼但未找到已知的收盤價欄位"
-    return None, None, "OpenAPI 中找不到對應股票代號"
+                        pass
+        # 若沒有已知 close 欄位，嘗試從整列中找到第一個可轉為 float 的欄位（保守）
+        for v in row.values():
+            try:
+                if v not in (None, "", "-"):
+                    cand = float(str(v).replace(",", ""))
+                    # 若 cand 看起來像價格（例如 < 1000000），接受
+                    if abs(cand) < 1e7:
+                        return cand, row, "找到可轉為數值的欄位，但非已知 close 欄位（使用推測值）"
+            except Exception:
+                continue
+        # 若都沒有，回傳該 row 以便人工檢查
+        return None, row, "找到對應代碼但未找到已知的收盤價欄位"
+
+    # 如果整個迴圈沒有找到對應代碼
+    # 提供 sample keys 給 debug
+    sample_keys_str = ", ".join(list(sample_keys)[:20])
+    return None, None, f"OpenAPI 中找不到對應股票代號；樣本欄位: {sample_keys_str}。若欄位有調整，請檢查 {OPENAPI_UI_URL} 或 {OPENAPI_STOCK_DAY_ALL_URL}"
 
 # -------------------------
 # 證交所 summary.json（盤中即時大盤指數、當下累積成交金額）
@@ -193,17 +305,14 @@ def fetch_realtime_quotes_mis(code_map: Dict[str, str]) -> Tuple[Dict[str, Any],
         result = {}
         for item in data.get("msgArray", []):
             code = item.get("c")
-            # item 可能包含 'c' = code (like '0052'), 有時候為整數字串
             name = code_to_name.get(code) or code_to_name.get(str(code).zfill(4))
             if not name:
-                # 有時回傳的 code 欄跟我們的 mapping 不一致，試著以 'n' (name) 去 match
                 n = item.get("n")
                 for k, v in code_map.items():
                     if n and (str(n).find(k) != -1 or str(k).find(str(n)) != -1):
                         name = k
                         break
             if not name:
-                # 跳過不在我們監控清單內的項目
                 continue
 
             def _to_float(s):
