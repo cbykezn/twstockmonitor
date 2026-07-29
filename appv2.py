@@ -78,6 +78,27 @@ def fetch_twse_market_turnover():
     except Exception as e:
         return None, f"連線錯誤: {str(e)}"
 
+# === 證交所首頁同款 API：summary.json 直接提供「盤中即時」大盤指數/漲跌/成交金額 ===
+# 免安裝 session、免 cookie，比 MIS API 簡單很多，且已實測確認欄位正確：
+#   TSE_I = 加權指數, TSE_D = 漲跌點數, TSE_P = 漲跌%, TSE_V = 當下累積成交金額(億元)
+@st.cache_data(ttl=10)
+def fetch_twse_summary():
+    try:
+        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+        ts = int(datetime.now().timestamp() * 1000)
+        url = f"https://www.twse.com.tw/res/data/zh/home/summary.json?_={ts}"
+        res = requests.get(url, headers=headers, timeout=8)
+        data = res.json()
+        return {
+            "index": data.get("TSE_I"),
+            "diff": data.get("TSE_D"),
+            "pct": data.get("TSE_P"),
+            "turnover_yi": data.get("TSE_V"),  # 億元，盤中即時累積金額
+            "time": data.get("SHTIME"),
+        }, "Success"
+    except Exception as e:
+        return {}, f"summary.json 連線錯誤: {str(e)}"
+
 # === 證交所 MIS 即時報價 API：抓「盤中即時」的指數/個股價格、漲跌、成交量 ===
 # 免費、不需 API Key，官方資料來源，更新頻率可達秒級
 # 注意：這是未公開文件的 API（業界常用），欄位含義：
@@ -204,8 +225,9 @@ mis_codes = {"大盤": "t00", "0052": "0052", "00830": "00830", "00662": "00662"
 prices, changes, history_dfs, ma20_now, ma20_prev = {}, {}, {}, {}, {}
 
 with st.spinner('正在同步證交所官方數據與最新報價...'):
-    real_twse_vol, api_msg = fetch_twse_market_turnover()
-    realtime_quotes, rt_msg = fetch_realtime_quotes(mis_codes)
+    real_twse_vol, api_msg = fetch_twse_market_turnover()      # EOD 官方日成交金額（備援/參考用）
+    twse_summary, summary_msg = fetch_twse_summary()            # ✅ 大盤即時指數/漲跌/成交金額（首選）
+    realtime_quotes, rt_msg = fetch_realtime_quotes(mis_codes)  # 個股/ETF 即時報價與成交量
 
     # 歷史日線資料（用來畫圖 / 算均線）：今天的即時價已經由 MIS API 負責，
     # 所以這裡一天抓一次就夠，快取用「日期」當 key，同一天內不管刷新幾次都不會重打 yfinance。
@@ -247,26 +269,38 @@ with st.spinner('正在同步證交所官方數據與最新報價...'):
         st.session_state[f"last_good_history_{name}"] = df
         history_dfs[name] = df
 
-        rt = realtime_quotes.get(name)
-        if rt and rt.get("price") is not None and rt.get("prev_close") is not None:
-            # ✅ 用證交所即時報價計算漲跌（修正原本用歷史K棒相減不準的問題）
-            current_price = rt["price"]
-            prev_close = rt["prev_close"]
-            prices[name] = round(current_price, 2)
-            diff_amount = current_price - prev_close
-            changes[name] = {"amount": diff_amount, "pct": (diff_amount / prev_close) * 100}
+        current_price, prev_close = None, None
 
-            # 盤中即時更新今天這根K棒，讓圖表也同步跳動
-            today = datetime.now(TW_TZ).date()
-            if df.index[-1].date() == today:
-                df.loc[df.index[-1], "Close"] = current_price
-                df.loc[df.index[-1], "High"] = max(df["High"].iloc[-1], current_price)
-                df.loc[df.index[-1], "Low"] = min(df["Low"].iloc[-1], current_price)
+        if name == "大盤" and twse_summary.get("index") is not None:
+            # ✅ 大盤優先用 summary.json（已實測驗證，最簡單穩定）
+            current_price = twse_summary["index"]
+            diff_amount = twse_summary["diff"]
+            pct = twse_summary["pct"]
+            prices[name] = round(current_price, 2)
+            changes[name] = {"amount": diff_amount, "pct": pct}
+            prev_close = current_price - diff_amount
         else:
-            # 備援：MIS API 失敗時，退回原本用歷史資料算漲跌的方式
-            prices[name] = round(df['Close'].iloc[-1], 2)
-            diff_amount = df['Close'].iloc[-1] - df['Close'].iloc[-2]
-            changes[name] = {"amount": diff_amount, "pct": (diff_amount / df['Close'].iloc[-2]) * 100}
+            rt = realtime_quotes.get(name)
+            if rt and rt.get("price") is not None and rt.get("prev_close") is not None:
+                # ✅ 個股/ETF 用 MIS 即時報價計算漲跌
+                current_price = rt["price"]
+                prev_close = rt["prev_close"]
+                prices[name] = round(current_price, 2)
+                diff_amount = current_price - prev_close
+                changes[name] = {"amount": diff_amount, "pct": (diff_amount / prev_close) * 100}
+            else:
+                # 備援：即時 API 都失敗時，退回原本用歷史資料算漲跌的方式
+                current_price = df['Close'].iloc[-1]
+                prices[name] = round(current_price, 2)
+                diff_amount = df['Close'].iloc[-1] - df['Close'].iloc[-2]
+                changes[name] = {"amount": diff_amount, "pct": (diff_amount / df['Close'].iloc[-2]) * 100}
+
+        # 盤中即時更新今天這根K棒，讓圖表也同步跳動
+        today = datetime.now(TW_TZ).date()
+        if current_price is not None and df.index[-1].date() == today:
+            df.loc[df.index[-1], "Close"] = current_price
+            df.loc[df.index[-1], "High"] = max(df["High"].iloc[-1], current_price)
+            df.loc[df.index[-1], "Low"] = min(df["Low"].iloc[-1], current_price)
 
         ma = df['Close'].rolling(window=20).mean()
         ma20_now[name], ma20_prev[name] = round(ma.iloc[-1], 2), round(ma.iloc[-2], 2)
@@ -274,11 +308,13 @@ with st.spinner('正在同步證交所官方數據與最新報價...'):
 if len(prices) == 4:
     tw_df = history_dfs["大盤"]
 
-    if rt_msg != "Success":
-        st.sidebar.warning(f"⚠️ 即時報價 API 狀態：{rt_msg}\n目前漲跌%為備援計算（可能不即時）")
+    if summary_msg == "Success":
+        st.sidebar.success(f"🟢 大盤即時資料已連線（更新時間：{twse_summary.get('time', '-')}）")
     else:
-        last_update = realtime_quotes.get("大盤", {}).get("time", "-")
-        st.sidebar.success(f"🟢 即時報價已連線（最後更新時間：{last_update}）")
+        st.sidebar.warning(f"⚠️ 大盤即時 API 狀態：{summary_msg}\n目前漲跌%為備援計算（可能不即時）")
+
+    if rt_msg != "Success":
+        st.sidebar.warning(f"⚠️ 個股/ETF 即時報價 API 狀態：{rt_msg}\n目前漲跌%為備援計算（可能不即時）")
 
     # === 側邊欄設定 ===
     st.sidebar.header("⚙️ 參數設定與盤中觀察")
@@ -295,9 +331,17 @@ if len(prices) == 4:
 
     use_auto_vol = st.sidebar.checkbox("自動抓取證交所官方成交量", value=True)
     if use_auto_vol:
-        if real_twse_vol is not None:
+        if twse_summary.get("turnover_yi") is not None:
+            # ✅ summary.json 盤中即時累積成交金額（不用再用「昨量×時間比例」估算）
+            daily_volume = twse_summary["turnover_yi"]
+            st.sidebar.success(f"🟢 盤中即時成交金額: **{format_volume(daily_volume)}**\n"
+                                f"（更新時間 {twse_summary.get('time', '-')}）")
+        elif real_twse_vol is not None:
+            # 備援：summary.json 失敗時，退回昨日 EOD 量做估算
             daily_volume = calculate_estimated_volume(real_twse_vol)
-            st.sidebar.info(f"🏛️ 證交所官方實際量: **{format_volume(real_twse_vol)}**\n⏱️ 系統計算成交量: **{format_volume(daily_volume)}**")
+            st.sidebar.warning(f"⚠️ 即時成交金額 API 失敗（{summary_msg}），改用估算值\n"
+                                f"🏛️ 官方前一日量: **{format_volume(real_twse_vol)}**\n"
+                                f"⏱️ 估算今日量: **{format_volume(daily_volume)}**")
         else:
             st.sidebar.error(f"API 讀取失敗: {api_msg}\n請改用手動輸入。")
             daily_volume = st.sidebar.number_input("手動輸入今日成交金額 (億)", value=10835.69, step=50.0, format="%.2f")
