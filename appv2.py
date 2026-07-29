@@ -94,6 +94,9 @@ def fugle_store_get_all() -> Dict[str, Dict[str, Any]]:
 # -------------------------
 # 讀取 Token (Fugle & Gemini)
 # -------------------------
+# -------------------------
+# 讀取 Token (Fugle & Gemini 暴力掃描版)
+# -------------------------
 def get_api_tokens():
     fugle_tok = None
     gemini_tok = None
@@ -102,11 +105,15 @@ def get_api_tokens():
         secrets = st.secrets
         for k, v in secrets.items():
             k_upper = k.upper()
+            
+            # 1. 抓取直接寫成字串的 (例如 GEMINI_API_KEY = "xxx")
             if isinstance(v, str):
                 if "FUGLE" in k_upper:
                     fugle_tok = v.strip()
                 if "GEMINI" in k_upper:
                     gemini_tok = v.strip()
+                    
+            # 2. 抓取寫在區塊裡的 (例如 [GEMINI] \n api_key = "xxx")
             elif hasattr(v, "items"):
                 for sub_k, sub_v in v.items():
                     if isinstance(sub_v, str):
@@ -117,6 +124,7 @@ def get_api_tokens():
     except Exception:
         pass
 
+    # 環境變數備援
     if not fugle_tok:
         fugle_tok = os.environ.get("FUGLE_TOKEN") or os.environ.get("FUGLE_API_KEY")
     if not gemini_tok:
@@ -127,7 +135,7 @@ def get_api_tokens():
 fugle_token, gemini_api_key = get_api_tokens()
 
 # -------------------------
-# 🤖 Gemini AI 盤後解析
+# 🤖 Gemini AI 盤後解析 (設定快取：每天只跑一次)
 # -------------------------
 @st.cache_data(ttl=24*3600)
 def analyze_kline_with_gemini(df_recent_json: str, api_key: str, date_str: str) -> str:
@@ -135,13 +143,14 @@ def analyze_kline_with_gemini(df_recent_json: str, api_key: str, date_str: str) 
         return "⚠️ 請在 secrets.toml 設定 GEMINI_API_KEY，即可啟用 AI 自動判斷 K 線型態與盤勢解析。"
     try:
         genai.configure(api_key=api_key)
+        model = genai.GenerativeModel('gemini-3.6-flash')
         prompt = f"""
         你是一位專業的台股技術分析師。現在的日期是 {date_str}。
         這是我提供的台股加權指數近 10 個交易日的 OHLCV 報價（JSON格式，日期為鍵值，包含開、高、低、收、量）：
         {df_recent_json}
         
         請根據最新一日的 K 線數據與近 10 日走勢，執行以下任務（請保持客觀、精練）：
-        1. 判斷最新一個交易日的「K 線型態」（例如：實體黑K、實體紅K、長下影線、十字線、孕線等）。
+        1. 判斷最新一個交易日的「K 線型態」（例如：實體黑K、實體紅K、長下影線、長上影線、十字線、孕線等）。
         2. 判斷是否有打底跡象（例如 W 底、破底翻等）。
         3. 給出一段 100 字以內的精簡盤勢分析。
         
@@ -149,28 +158,17 @@ def analyze_kline_with_gemini(df_recent_json: str, api_key: str, date_str: str) 
         **📌 今日 K 線型態**：[填入型態]
         **📊 盤勢解析**：[填入精簡分析]
         """
-        
-        models_to_try = ['gemini-1.5-flash', 'gemini-1.5-flash-latest', 'gemini-pro']
-        last_error = ""
-        
-        for m_name in models_to_try:
-            try:
-                model = genai.GenerativeModel(m_name)
-                response = model.generate_content(prompt)
-                return response.text
-            except Exception as e:
-                last_error = str(e)
-                continue
-                
-        return f"❌ AI 解析發生錯誤（已嘗試切換多種模型皆失敗）：{last_error}"
+        response = model.generate_content(prompt)
+        return response.text
     except Exception as e:
-        return f"❌ AI 設定發生錯誤：{str(e)}"
+        return f"❌ AI 解析發生錯誤：{str(e)}"
 
 # -------------------------
 # Fugle v1.0 WebSocket
 # -------------------------
 def start_fugle_ws(symbols: List[str], token: str):
-    if not WS_AVAILABLE or not token: return None
+    if not WS_AVAILABLE or not token:
+        return None
     ws_url = "wss://api.fugle.tw/marketdata/v1.0/stock/streaming"
     def on_open(ws):
         ws.send(json.dumps({"event": "auth", "apikey": token}))
@@ -213,7 +211,7 @@ def start_fugle_ws(symbols: List[str], token: str):
     return t
 
 # -------------------------
-# Fugle v1.0 REST API
+# Fugle v1.0 REST API (盤中備援)
 # -------------------------
 def fetch_fugle_intraday(symbol: str, token: str) -> Dict[str, Any]:
     if not token: return {"error": "No token"}
@@ -348,26 +346,22 @@ with st.spinner('正在同步數據、計算指標與 AI 解析...'):
 
         current_price = realtime_quotes.get(name, {}).get("price")
         
-        # === 🌟 修正：精準判斷「昨日收盤價」 ===
-        # 因為 yfinance 在盤後會更新今日 K 棒，若無腦拿最後一筆 (iloc[-1]) 相減會變成 0
-        today_date = datetime.now(TW_TZ).date()
-        if df.index[-1].date() == today_date and len(df) >= 2:
-            yf_prev_close = df['Close'].iloc[-2]
-        else:
-            yf_prev_close = df['Close'].iloc[-1]
-            
         if current_price is not None:
             prices[name] = round(current_price, 2)
-            diff_amount = current_price - yf_prev_close
-            changes[name] = {"amount": diff_amount, "pct": (diff_amount / yf_prev_close) * 100}
+            try:
+                diff_amount = current_price - df['Close'].iloc[-1]
+                changes[name] = {"amount": diff_amount, "pct": (diff_amount / df['Close'].iloc[-1]) * 100}
+            except:
+                changes[name] = {"amount": 0.0, "pct": 0.0}
         else:
             current_price = df['Close'].iloc[-1]
             prices[name] = round(current_price, 2)
-            diff_amount = current_price - yf_prev_close
-            changes[name] = {"amount": diff_amount, "pct": (diff_amount / yf_prev_close) * 100}
+            diff_amount = df['Close'].iloc[-1] - df['Close'].iloc[-2]
+            changes[name] = {"amount": diff_amount, "pct": (diff_amount / df['Close'].iloc[-2]) * 100}
 
-        # 更新今日 K 棒 (確保當天最新價格寫入日 K，且不影響昨收判斷)
-        if current_price is not None and df.index[-1].date() == today_date:
+        # 更新今日 K 棒
+        today = datetime.now(TW_TZ).date()
+        if current_price is not None and df.index[-1].date() == today:
             df.loc[df.index[-1], "Close"] = current_price
             df.loc[df.index[-1], "High"] = max(df["High"].iloc[-1], current_price)
             df.loc[df.index[-1], "Low"] = min(df["Low"].iloc[-1], current_price)
@@ -410,6 +404,7 @@ with st.spinner('正在同步數據、計算指標與 AI 解析...'):
         # 🤖 觸發 Gemini AI 盤後解析
         st.markdown("##### 🤖 Gemini 雙子星 AI 盤後解析")
         if GENAI_AVAILABLE and gemini_api_key:
+            # 取近 10 日資料餵給 AI (簡化浮點數避免超出字數)
             recent_df = history_dfs["大盤"].tail(10)[['Open', 'High', 'Low', 'Close', 'Volume']].copy()
             recent_df = recent_df.round(2)
             recent_df.index = recent_df.index.strftime('%Y-%m-%d')
@@ -433,6 +428,7 @@ with st.spinner('正在同步數據、計算指標與 AI 解析...'):
         avg_vol_20 = st.sidebar.number_input("官方近 20 日均量 (億)", value=float(twse_20d_avg), step=100.0)
         daily_volume = st.sidebar.number_input(f"今日大盤成交量 ({vol_source}) 億", value=float(final_daily_volume), step=50.0, format="%.2f")
         
+        # 計算佔均量百分比
         vol_percentage = (daily_volume / avg_vol_20 * 100) if avg_vol_20 > 0 else 0
         if vol_percentage <= 70:
             st.sidebar.success(f"🔥 **今日量縮比：{vol_percentage:.1f}%**\n\n(小於 70%，已達窒息量標準)")
