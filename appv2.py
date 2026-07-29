@@ -63,7 +63,7 @@ def format_volume(yi):
         return f"{yi:,.2f} 億元"
 
 # -------------------------
-# Fugle symbol mapping (your monitored symbols)
+# 🌟 極簡化：Fugle 查詢一律使用最純粹的台股代號字串
 # -------------------------
 FUGLE_SYMBOL_MAP = {
     "0052": "0052",
@@ -84,7 +84,7 @@ def fugle_store_get_all() -> Dict[str, Dict[str, Any]]:
         return dict(_fugle_store["data"])
 
 # -------------------------
-# 🌟 無敵版 Token 讀取函數 (暴力掃描所有可能格式)
+# 讀取 Token
 # -------------------------
 def get_fugle_token_and_source():
     token = None
@@ -93,17 +93,11 @@ def get_fugle_token_and_source():
     try:
         secrets = st.secrets
         secrets_keys = list(secrets.keys())
-        if secrets_keys:
-            st.sidebar.info(f"st.secrets 成功讀取，目前含有頂層鍵: {', '.join(secrets_keys)}")
-        
-        # 1. 暴力掃描所有鍵值
         for k, v in secrets.items():
-            # 如果是純字串 (如 FUGLE_TOKEN = "xxx")
             if isinstance(v, str) and v.strip():
                 token = v.strip()
                 source = f"st.secrets['{k}']"
                 break
-            # 如果是區塊格式 (如 [FUGLE] token = "xxx")
             elif hasattr(v, "items"):
                 for sub_k, sub_v in v.items():
                     if isinstance(sub_v, str) and sub_v.strip():
@@ -115,7 +109,6 @@ def get_fugle_token_and_source():
     except Exception:
         secrets_keys = None
 
-    # 2. 環境變數備援
     if not token:
         for env_key in ("FUGLE_TOKEN", "FUGLE__TOKEN", "FUGLE_API_KEY", "FUGLEKEY"):
             val = os.environ.get(env_key)
@@ -123,322 +116,101 @@ def get_fugle_token_and_source():
                 token = val.strip()
                 source = f"env:{env_key}"
                 break
-
     return token, source, secrets_keys
 
 fugle_token, fugle_token_source, fugle_secrets_keys = get_fugle_token_and_source()
 if fugle_token:
-    masked = (fugle_token[:4] + "..." + fugle_token[-4:]) if len(fugle_token) > 8 else "****"
-    st.sidebar.success(f"Fugle token 已成功載入！\n（來源: {fugle_token_source}，{masked}）")
+    pass # 靜默載入，維持版面乾淨
 else:
-    st.sidebar.error("Fugle token 依然未載入，請確認 secrets.toml 格式是否正確。")
+    st.sidebar.error("Fugle token 未載入，請確認 secrets.toml 設定。")
 
 # -------------------------
-# Fugle WebSocket (background thread)
+# Fugle WebSocket
 # -------------------------
 def start_fugle_ws(symbols: List[str], token: str):
-    if not WS_AVAILABLE:
-        st.sidebar.error("websocket-client 未安裝，請在 requirements.txt 加上 websocket-client 並重新部署。")
+    if not WS_AVAILABLE or not token:
         return None
-    if not token:
-        st.sidebar.warning("Fugle token 未設定，WebSocket 不會啟動。")
-        return None
-
     ws_url = f"wss://realtime.fugle.tw/v0/streams/quote?token={token}"
-
+    
     def on_open(ws):
-        print("Fugle WS opened")
         for s in symbols:
             try:
+                # 訂閱時，直接傳送純字串代號
                 sub_msg = json.dumps({"type": "subscribe", "symbol": s})
                 ws.send(sub_msg)
                 time.sleep(0.05)
-            except Exception as e:
-                print("subscribe error", e)
-
-    def _extract_value_from_msg(data: Dict[str, Any]) -> Tuple[Optional[float], Optional[float], Optional[str]]:
-        candidates_price = [
-            lambda d: d.get("last"), lambda d: d.get("lastPrice"),
-            lambda d: d.get("price"), lambda d: d.get("z"),
-            lambda d: d.get("trade", {}).get("price") if isinstance(d.get("trade"), dict) else None
-        ]
-        candidates_vol = [
-            lambda d: d.get("volume"), lambda d: d.get("v"),
-            lambda d: d.get("trade", {}).get("volume") if isinstance(d.get("trade"), dict) else None
-        ]
-        candidates_time = [
-            lambda d: d.get("time"), lambda d: d.get("t"), lambda d: d.get("timestamp")
-        ]
-
-        p = None
-        for f in candidates_price:
-            try:
-                val = f(data)
-                if val not in (None, "", "-"):
-                    p = float(val)
-                    break
             except Exception:
-                continue
-
-        vol = None
-        for f in candidates_vol:
-            try:
-                val = f(data)
-                if val not in (None, "", "-"):
-                    vol = float(val)
-                    break
-            except Exception:
-                continue
-
-        tm = None
-        for f in candidates_time:
-            try:
-                val = f(data)
-                if val not in (None, "", "-"):
-                    tm = str(val)
-                    break
-            except Exception:
-                continue
-
-        return p, vol, tm
+                pass
 
     def on_message(ws, message):
         try:
             data = json.loads(message)
-        except Exception:
-            try:
-                st.sidebar.warning("收到無法解析的 Fugle WS 訊息（raw），側欄顯示以供 debug。")
-                st.sidebar.text(message)
-            except Exception:
-                pass
-            return
-
-        sym = data.get("symbol") or data.get("s") or data.get("instrumentId") or data.get("id")
-        key = None
-        if sym:
+            # 從 WS 訊息中抓出 symbol
+            sym = data.get("symbol") or data.get("s") or data.get("id")
+            if not sym: return
+            
+            sym_str = str(sym)
+            target_key = None
             for k, v in FUGLE_SYMBOL_MAP.items():
-                if str(sym).upper() == v.upper() or str(sym).endswith(k):
-                    key = k
+                if sym_str == v or sym_str.endswith(k):
+                    target_key = k
                     break
-        if not key:
-            def _search_for_symbol(obj):
-                if isinstance(obj, dict):
-                    for kk, vv in obj.items():
-                        if isinstance(vv, str) and any(vv.upper() == mapv.upper() or vv.endswith(k) for k, mapv in FUGLE_SYMBOL_MAP.items()):
-                            return kk, vv
-                        res = _search_for_symbol(vv)
-                        if res:
-                            return res
-                if isinstance(obj, list):
-                    for item in obj:
-                        res = _search_for_symbol(item)
-                        if res:
-                            return res
-                return None
-            res = _search_for_symbol(data)
-            if res:
-                _, found_val = res
-                for k, v in FUGLE_SYMBOL_MAP.items():
-                    if str(found_val).upper() == v.upper() or str(found_val).endswith(k):
-                        key = k
-                        break
-
-        price, volume, msg_time = _extract_value_from_msg(data)
-        if not key:
-            st.sidebar.warning("Fugle WS 訊息中未識別到監控標的代碼 (symbol)，原始 JSON 如下：")
-            st.sidebar.json(data)
-            return
-        if price is None and volume is None:
-            st.sidebar.warning(f"Fugle WS 訊息解析失敗（{key}），請檢查 raw JSON (側欄)。")
-            st.sidebar.json(data)
-            fugle_store_set(key, {"raw": data, "time": msg_time})
-            return
-        fugle_store_set(key, {"price": price, "volume": volume, "time": msg_time, "raw": data})
-
-    def on_error(ws, error):
-        print("Fugle WS error:", error)
-        try:
-            st.sidebar.error(f"Fugle WebSocket 發生錯誤: {error}")
-        except Exception:
-            pass
-
-    def on_close(ws, close_status_code, close_msg):
-        print("Fugle WS closed", close_status_code, close_msg)
-        try:
-            st.sidebar.warning("Fugle WebSocket 連線已關閉，將嘗試重連。")
+            
+            if target_key:
+                # 簡單抓取價格與量
+                price = data.get("lastPrice") or data.get("price") or data.get("z")
+                vol = data.get("volume") or data.get("v")
+                tm = data.get("time") or data.get("t")
+                if price:
+                    fugle_store_set(target_key, {"price": float(price), "volume": float(vol) if vol else None, "time": tm, "raw": data})
         except Exception:
             pass
 
     def run_loop():
         while True:
             try:
-                ws = websocket.WebSocketApp(ws_url, on_open=on_open, on_message=on_message, on_error=on_error, on_close=on_close)
+                ws = websocket.WebSocketApp(ws_url, on_open=on_open, on_message=on_message)
                 ws.run_forever(ping_interval=30, ping_timeout=10)
-            except Exception as e:
-                print("WS run_forever exception:", e)
-                try:
-                    st.sidebar.warning(f"Fugle WS run_forever 例外: {e}，3秒後重試。")
-                except Exception:
-                    pass
-            time.sleep(3)
+            except Exception:
+                time.sleep(3)
 
     t = threading.Thread(target=run_loop, daemon=True)
     t.start()
     return t
 
 # -------------------------
-# Fugle meta lookup: find numeric symbolId (cached)
+# 🌟 修正：Fugle Intraday (強迫對齊純數字 symbolId)
 # -------------------------
-@st.cache_data(ttl=60 * 10)
-def fetch_fugle_symbol_meta(code_or_symbol: str, token: str) -> Tuple[Optional[int], Optional[Dict[str, Any]]]:
-    if not token:
-        return None, None
-    headers = {"X-API-KEY": token}
-    try:
-        s = code_or_symbol.strip()
-        if s.isdigit():
-            url = "https://api.fugle.tw/marketdata/v1.0/meta/symbols"
-            params = {"symbolId": s}
-            r = requests.get(url, headers=headers, params=params, timeout=8)
-            if r.status_code == 200:
-                js = r.json()
-                data = js.get("data") or js
-                if isinstance(data, list) and data:
-                    item = data[0]
-                    try:
-                        return int(item.get("symbolId")), item
-                    except Exception:
-                        sid = item.get("symbolId")
-                        if isinstance(sid, str) and sid.isdigit():
-                            return int(sid), item
-                if isinstance(data, dict) and data.get("symbolId"):
-                    return int(data.get("symbolId")), data
-
-        cand = []
-        if s.upper().startswith("TW."):
-            cand.append(s)
-            cand.append(s.split(".", 1)[1])
-        else:
-            cand.append(s)
-            cand.append("TW." + s)
-        url = "https://api.fugle.tw/marketdata/v1.0/meta/symbols"
-        for q in cand:
-            params = {"q": q}
-            r = requests.get(url, headers=headers, params=params, timeout=8)
-            if r.status_code != 200:
-                continue
-            js = r.json()
-            arr = js.get("data") or js.get("result") or js
-            if isinstance(arr, list) and arr:
-                item = arr[0]
-                sid = item.get("symbolId")
-                if isinstance(sid, (int, float)):
-                    return int(sid), item
-                if isinstance(sid, str) and sid.isdigit():
-                    return int(sid), item
-        try:
-            st.sidebar.warning(f"Fugle symbol meta 未找到: {code_or_symbol}（嘗試過：{cand}）")
-        except Exception:
-            pass
-        return None, None
-    except Exception as e:
-        try:
-            st.sidebar.error(f"fetch_fugle_symbol_meta 例外: {e}")
-        except Exception:
-            pass
-        return None, None
-
-# -------------------------
-# Fugle intraday using numeric symbolId
-# -------------------------
-def fetch_fugle_intraday(symbol_or_code: str, token: str) -> Dict[str, Any]:
+def fetch_fugle_intraday(symbol: str, token: str) -> Dict[str, Any]:
     if not token:
         return {"error": "Fugle token not set"}
+    
+    # 確保丟給 API 的 symbolId 永遠是純字串，且不帶任何前綴
+    clean_symbol = str(symbol).strip().replace("TW.", "")
+    
     headers = {"X-API-KEY": token}
+    url = f"https://api.fugle.tw/realtime/v0.3/intraday/quote"
+    params = {"symbolId": clean_symbol}
+    
     try:
-        s = str(symbol_or_code).strip()
-        if s.isdigit():
-            symbol_id_numeric = int(s)
-        else:
-            meta_id, meta_raw = fetch_fugle_symbol_meta(s, token)
-            if meta_id:
-                symbol_id_numeric = meta_id
-            else:
-                return {"error": f"Cannot find Fugle symbolId for {symbol_or_code}"}
-
-        url = "https://api.fugle.tw/realtime/v0.3/intraday/quote"
-        params = {"symbolId": symbol_id_numeric}
         r = requests.get(url, headers=headers, params=params, timeout=8)
-        try:
-            r.raise_for_status()
-        except requests.HTTPError as he:
-            try:
-                st.sidebar.error(f"Fugle intraday HTTP {r.status_code} for symbolId={symbol_id_numeric}")
-                try:
-                    st.sidebar.json(r.json())
-                except Exception:
-                    st.sidebar.text(r.text[:2000])
-            except Exception:
-                pass
-            return {"error": f"HTTP {r.status_code}: {he}"}
-
+        if r.status_code != 200:
+            st.sidebar.error(f"Fugle fallback HTTP {r.status_code} for {clean_symbol}")
+            st.sidebar.json(r.json()) # 顯示錯誤訊息供 debug
+            return {"error": f"HTTP {r.status_code}"}
+        
         data = r.json()
         container = data.get("data") or data.get("result") or data
-        price = None
-        volume = None
         if isinstance(container, dict):
-            quote = container.get("quote") if isinstance(container.get("quote"), dict) else container
-            price = quote.get("lastPrice") or quote.get("last") or container.get("lastPrice") or container.get("last")
-            volume = quote.get("volume") or container.get("volume") or container.get("totalVolume")
-            if price is None:
-                def _deep_find_number(obj):
-                    if isinstance(obj, dict):
-                        for v in obj.values():
-                            res = _deep_find_number(v)
-                            if res is not None:
-                                return res
-                    if isinstance(obj, list):
-                        for it in obj:
-                            res = _deep_find_number(it)
-                            if res is not None:
-                                return res
-                    if isinstance(obj, (int, float)):
-                        return float(obj)
-                    if isinstance(obj, str):
-                        s = obj.replace(",", "")
-                        if s.replace(".", "", 1).isdigit():
-                            return float(s)
-                    return None
-                price = _deep_find_number(container)
-        else:
-            def _deep_find_number(obj):
-                if isinstance(obj, dict):
-                    for v in obj.values():
-                        res = _deep_find_number(v)
-                        if res is not None:
-                            return res
-                if isinstance(obj, list):
-                    for it in obj:
-                        res = _deep_find_number(it)
-                        if res is not None:
-                            return res
-                if isinstance(obj, (int, float)):
-                    return float(obj)
-                if isinstance(obj, str):
-                    s = obj.replace(",", "")
-                    if s.replace(".", "", 1).isdigit():
-                        return float(s)
-                return None
-            price = _deep_find_number(container)
-
-        return {"price": float(price) if price is not None else None,
-                "volume": float(volume) if volume is not None else None,
-                "raw": data, "symbolId": symbol_id_numeric}
+            quote = container.get("quote") or container
+            price = quote.get("lastPrice") or quote.get("last")
+            vol = quote.get("volume") or quote.get("totalVolume")
+            
+            if price:
+                return {"price": float(price), "volume": float(vol) if vol else None, "raw": data}
+        
+        return {"error": "Cannot parse price from response"}
     except Exception as e:
-        try:
-            st.sidebar.error(f"fetch_fugle_intraday exception: {e}")
-        except Exception:
-            pass
         return {"error": str(e)}
 
 # -------------------------
@@ -476,7 +248,7 @@ def fetch_twse_summary():
         return {}, f"summary.json 連線錯誤: {e}"
 
 # -------------------------
-# K-line drawing (kept)
+# K-line drawing
 # -------------------------
 def draw_professional_chart(df, title_name):
     df = df.copy()
@@ -522,13 +294,9 @@ if not st.session_state["fugle_ws_started"]:
         symbols_to_sub = list(FUGLE_SYMBOL_MAP.values())
         start_fugle_ws(symbols_to_sub, fugle_token)
         st.session_state["fugle_ws_started"] = True
-        st.sidebar.info("🔌 Fugle WebSocket 背景連線已啟動（若側欄無錯誤，表示連線正常）。")
-    elif fugle_token and not WS_AVAILABLE:
-        st.sidebar.warning("Fugle token 有設定，但 websocket-client 未安裝，無法啟動 WS。請安裝並重新部署。")
-    else:
-        st.sidebar.warning("Fugle token 未設定，請在 Secrets 或 environment 設定。")
+        st.sidebar.info("🔌 Fugle WebSocket 背景連線已啟動。")
 
-with st.spinner('正在同步證交所官方數據、Fugle 即時數據與最新報價...'):
+with st.spinner('正在同步數據與最新報價...'):
     openapi_all, openapi_msg = fetch_twse_openapi_stock_day_all()
     twse_summary, summary_msg = fetch_twse_summary()
 
@@ -546,10 +314,10 @@ with st.spinner('正在同步證交所官方數據、Fugle 即時數據與最新
                 "raw": entry.get("raw")
             }
         else:
+            # fallback to Fugle REST intraday
             fallback = fetch_fugle_intraday(fugle_sym, fugle_token) if fugle_token else {"error": "no token"}
             if "error" in fallback:
                 realtime_quotes[key] = {}
-                st.sidebar.warning(f"Fugle fallback 失敗 ({key}): {fallback.get('error')}")
             else:
                 price = fallback.get("price")
                 vol = fallback.get("volume")
@@ -583,9 +351,7 @@ with st.spinner('正在同步證交所官方數據、Fugle 即時數據與最新
             cache_key = f"last_good_history_{name}"
             if cache_key in st.session_state:
                 df = st.session_state[cache_key]
-                st.warning(f"⚠️ {name} 歷史資料更新失敗（{e}），暫時沿用上次成功的快取資料。")
             else:
-                st.error(f"❌ {name} 歷史資料抓取失敗，且無舊資料可用：{e}")
                 continue
 
         if df.empty:
@@ -601,63 +367,22 @@ with st.spinner('正在同步證交所官方數據、Fugle 即時數據與最新
             pct = twse_summary["pct"]
             prices[name] = round(current_price, 2)
             changes[name] = {"amount": diff_amount, "pct": pct}
-            prev_close = current_price - diff_amount
         else:
             rt = realtime_quotes.get(name)
             if rt and rt.get("price") is not None:
                 current_price = rt["price"]
-                prev_close = rt.get("prev_close") if rt.get("prev_close") not in (None, 0) else None
                 prices[name] = round(current_price, 2)
-                if prev_close:
-                    diff_amount = current_price - prev_close
-                    changes[name] = {"amount": diff_amount, "pct": (diff_amount / prev_close) * 100}
-                else:
-                    try:
-                        diff_amount = current_price - df['Close'].iloc[-1]
-                        changes[name] = {"amount": diff_amount, "pct": (diff_amount / df['Close'].iloc[-1]) * 100}
-                    except Exception:
-                        changes[name] = {"amount": 0.0, "pct": 0.0}
-            else:
-                fallback_price = None
                 try:
-                    oa = openapi_all if isinstance(openapi_all, list) else openapi_all.get("data", [])
-                    for row in oa:
-                        if isinstance(row, (list, tuple)):
-                            if any(str(cell).endswith(name) for cell in row if cell is not None):
-                                for cell in reversed(row):
-                                    try:
-                                        cand = float(str(cell).replace(",", ""))
-                                        fallback_price = cand
-                                        break
-                                    except Exception:
-                                        continue
-                        if fallback_price:
-                            break
-                        elif isinstance(row, dict):
-                            if any(str(v).endswith(name) for v in row.values() if v):
-                                for ck in ("Close", "close", "ClosePrice", "closePrice", "成交價", "收盤價"):
-                                    if ck in row and row[ck] not in (None, "", "-"):
-                                        try:
-                                            fallback_price = float(str(row[ck]).replace(",", ""))
-                                            break
-                                        except Exception:
-                                            continue
-                        if fallback_price:
-                            break
-                    if fallback_price is not None:
-                        current_price = fallback_price
-                        prices[name] = round(current_price, 2)
-                        changes[name] = {"amount": 0.0, "pct": 0.0}
-                    else:
-                        current_price = df['Close'].iloc[-1]
-                        prices[name] = round(current_price, 2)
-                        diff_amount = df['Close'].iloc[-1] - df['Close'].iloc[-2]
-                        changes[name] = {"amount": diff_amount, "pct": (diff_amount / df['Close'].iloc[-2]) * 100}
+                    diff_amount = current_price - df['Close'].iloc[-1]
+                    changes[name] = {"amount": diff_amount, "pct": (diff_amount / df['Close'].iloc[-1]) * 100}
                 except Exception:
-                    current_price = df['Close'].iloc[-1]
-                    prices[name] = round(current_price, 2)
-                    diff_amount = df['Close'].iloc[-1] - df['Close'].iloc[-2]
-                    changes[name] = {"amount": diff_amount, "pct": (diff_amount / df['Close'].iloc[-2]) * 100}
+                    changes[name] = {"amount": 0.0, "pct": 0.0}
+            else:
+                # 若 Fugle 沒抓到，退回使用昨天 yfinance 收盤價
+                current_price = df['Close'].iloc[-1]
+                prices[name] = round(current_price, 2)
+                diff_amount = df['Close'].iloc[-1] - df['Close'].iloc[-2]
+                changes[name] = {"amount": diff_amount, "pct": (diff_amount / df['Close'].iloc[-2]) * 100}
 
         today = datetime.now(TW_TZ).date()
         if current_price is not None and df.index[-1].date() == today:
@@ -670,11 +395,7 @@ with st.spinner('正在同步證交所官方數據、Fugle 即時數據與最新
 
     if len(prices) == 4:
         tw_df = history_dfs["大盤"]
-        if summary_msg == "Success":
-            st.sidebar.success(f"🟢 大盤即時資料已連線（更新時間：{twse_summary.get('time', '-')}）")
-        else:
-            st.sidebar.warning(f"⚠️ 大盤即時 API 狀態：{summary_msg}\n目前漲跌%為備援計算（可能不即時）")
-
+        
         st.sidebar.header("⚙️ 參數設定與盤中觀察")
         cost_52 = st.sidebar.number_input("0052 成本價", value=180.0, step=1.0)
         cost_830 = st.sidebar.number_input("00830 成本價", value=45.0, step=0.5)
@@ -696,7 +417,7 @@ with st.spinner('正在同步證交所官方數據、Fugle 即時數據與最新
         col3.metric(f"📦 00830 (損益: {loss_830}%)", f"{prices['00830']}", f"{changes['00830']['amount']:+.2f} ({changes['00830']['pct']:+.2f}%)", delta_color="inverse")
         col4.metric(f"📦 00662 (損益: {loss_662}%)", f"{prices['00662']}", f"{changes['00662']['amount']:+.2f} ({changes['00662']['pct']:+.2f}%)", delta_color="inverse")
 
-        st.caption(f"{'🔴 盤中即時更新中（以 Fugle WebSocket 為主）' if is_market_open() else '⚪ 目前非交易時間，顯示為最後收盤資料'}")
+        st.caption(f"{'🔴 盤中即時更新中（以 Fugle 數據為主）' if is_market_open() else '⚪ 目前非交易時間，顯示為最後收盤資料'}")
         st.markdown("---")
 
         worst_loss = min(loss_52, loss_830, loss_662)
