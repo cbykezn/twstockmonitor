@@ -401,17 +401,21 @@ with st.spinner('正在同步數據、計算指標與 AI 解析...'):
         # 繪製圖表
         st.plotly_chart(draw_professional_chart(history_dfs["大盤"], "加權指數 (大盤)"), use_container_width=True)
         
-        # 🤖 觸發 Gemini AI 盤後解析
+# 🤖 觸發 Gemini AI 盤後解析
         st.markdown("##### 🤖 Gemini 雙子星 AI 盤後解析")
         if GENAI_AVAILABLE and gemini_api_key:
-            # 取近 10 日資料餵給 AI (簡化浮點數避免超出字數)
-            recent_df = history_dfs["大盤"].tail(10)[['Open', 'High', 'Low', 'Close', 'Volume']].copy()
-            recent_df = recent_df.round(2)
-            recent_df.index = recent_df.index.strftime('%Y-%m-%d')
-            json_payload = recent_df.to_json(orient="index")
-            
-            ai_analysis_result = analyze_kline_with_gemini(json_payload, gemini_api_key, today_str)
-            st.info(ai_analysis_result)
+            if is_market_open():
+                # 盤中封印：不呼叫 API，避免浪費額度
+                st.info("⏳ **盤中不耗費資源**：AI 盤勢解析將於今日 13:30 收盤、價格鎖定後自動啟動。")
+            else:
+                # 盤後解鎖：傳送固定數據給 AI，並由快取機制保護
+                recent_df = history_dfs["大盤"].tail(10)[['Open', 'High', 'Low', 'Close', 'Volume']].copy()
+                recent_df = recent_df.round(2)
+                recent_df.index = recent_df.index.strftime('%Y-%m-%d')
+                json_payload = recent_df.to_json(orient="index")
+                
+                ai_analysis_result = analyze_kline_with_gemini(json_payload, gemini_api_key, today_str)
+                st.info(ai_analysis_result)
         elif not GENAI_AVAILABLE:
             st.warning("⚠️ 尚未安裝 Google AI 套件，請在終端機執行 `pip install google-generativeai`。")
         else:
