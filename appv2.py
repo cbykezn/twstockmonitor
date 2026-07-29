@@ -94,26 +94,37 @@ def fugle_store_get_all() -> Dict[str, Dict[str, Any]]:
 # -------------------------
 # 讀取 Token (Fugle & Gemini)
 # -------------------------
+# -------------------------
+# 讀取 Token (Fugle & Gemini 暴力掃描版)
+# -------------------------
 def get_api_tokens():
     fugle_tok = None
     gemini_tok = None
     
     try:
         secrets = st.secrets
-        # 尋找 Fugle
         for k, v in secrets.items():
-            if k.upper() in ["FUGLE_TOKEN", "FUGLE__TOKEN", "FUGLE_API_KEY", "FUGLE"] and isinstance(v, str):
-                fugle_tok = v.strip()
-            elif hasattr(v, "items") and "FUGLE" in k.upper():
+            k_upper = k.upper()
+            
+            # 1. 抓取直接寫成字串的 (例如 GEMINI_API_KEY = "xxx")
+            if isinstance(v, str):
+                if "FUGLE" in k_upper:
+                    fugle_tok = v.strip()
+                if "GEMINI" in k_upper:
+                    gemini_tok = v.strip()
+                    
+            # 2. 抓取寫在區塊裡的 (例如 [GEMINI] \n api_key = "xxx")
+            elif hasattr(v, "items"):
                 for sub_k, sub_v in v.items():
                     if isinstance(sub_v, str):
-                        fugle_tok = sub_v.strip()
-                        break
-        # 尋找 Gemini
-        gemini_tok = secrets.get("GEMINI_API_KEY", None)
+                        if "FUGLE" in k_upper or "FUGLE" in sub_k.upper():
+                            fugle_tok = sub_v.strip()
+                        if "GEMINI" in k_upper or "GEMINI" in sub_k.upper():
+                            gemini_tok = sub_v.strip()
     except Exception:
         pass
 
+    # 環境變數備援
     if not fugle_tok:
         fugle_tok = os.environ.get("FUGLE_TOKEN") or os.environ.get("FUGLE_API_KEY")
     if not gemini_tok:
