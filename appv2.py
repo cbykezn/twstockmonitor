@@ -69,8 +69,20 @@ def format_volume(yi):
     else:
         return f"{yi:,.2f} 億元"
 
+def safe_float(val: Any) -> Optional[float]:
+    """ 安全轉換浮點數，處理 --, None, 逗號字串 """
+    if val is None:
+        return None
+    val_str = str(val).replace(",", "").strip()
+    if not val_str or val_str == "--":
+        return None
+    try:
+        return float(val_str)
+    except ValueError:
+        return None
+
 # -------------------------
-# 🌟 Fugle 追蹤清單
+# 🌟 Fugle 追蹤清單與 API
 # -------------------------
 FUGLE_SYMBOL_MAP = {
     "大盤": "IX0001",
@@ -79,7 +91,6 @@ FUGLE_SYMBOL_MAP = {
     "00830": "00830",
 }
 
-# WebSocket 資料儲存區
 from threading import Lock
 _fugle_store = {"data": {}, "lock": Lock()}
 
@@ -90,6 +101,25 @@ def fugle_store_set(key: str, value: Dict[str, Any]):
 def fugle_store_get_all() -> Dict[str, Dict[str, Any]]:
     with _fugle_store["lock"]:
         return dict(_fugle_store["data"])
+
+def fetch_fugle_quote(symbol_code: str, token: str) -> Optional[Dict[str, float]]:
+    """ 嘗試透過 Fugle REST API 抓取即時報價 """
+    if not token:
+        return None
+    try:
+        url = f"https://api.fugle.tw/marketdata/v1.0/stock/intraday/quote/{symbol_code}"
+        headers = {"X-API-KEY": token}
+        res = requests.get(url, headers=headers, timeout=3)
+        if res.status_code == 200:
+            data = res.json()
+            close_p = safe_float(data.get("closePrice") or data.get("lastPrice"))
+            change_p = safe_float(data.get("change")) or 0.0
+            pct_p = safe_float(data.get("changePercent")) or 0.0
+            if close_p is not None:
+                return {"price": close_p, "amount": change_p, "pct": pct_p}
+    except Exception:
+        pass
+    return None
 
 # -------------------------
 # 讀取 Token (Fugle & Gemini)
@@ -178,9 +208,9 @@ def fetch_twse_summary():
         res.raise_for_status()
         data = res.json()
         return {
-            "index": float(str(data.get("TSE_I", "0")).replace(",", "")),
-            "diff": float(str(data.get("TSE_D", "0")).replace(",", "")),
-            "pct": float(str(data.get("TSE_P", "0")).replace(",", "")),
+            "index": safe_float(data.get("TSE_I")),
+            "diff": safe_float(data.get("TSE_D")),
+            "pct": safe_float(data.get("TSE_P")),
             "turnover_yi": data.get("TSE_V"),
         }, "Success"
     except Exception as e:
@@ -258,7 +288,7 @@ def draw_professional_chart(df, title_name):
     latest = df.iloc[-1]
     fig = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.03, row_heights=[0.6, 0.2, 0.2])
     fig.add_trace(go.Candlestick(x=df.index, open=df['Open'], high=df['High'], low=df['Low'], close=df['Close'],
-                increasing_line_color='#FF3333', decreasing_line_color='#00AA00', name="K線"), row=1, col=1)
+                                increasing_line_color='#FF3333', decreasing_line_color='#00AA00', name="K線"), row=1, col=1)
     fig.add_trace(go.Scatter(x=df.index, y=df['5MA'], line=dict(color='yellow', width=1), name=f'5MA: {latest["5MA"]:.2f}'), row=1, col=1)
     fig.add_trace(go.Scatter(x=df.index, y=df['10MA'], line=dict(color='hotpink', width=1), name=f'10MA: {latest["10MA"]:.2f}'), row=1, col=1)
     fig.add_trace(go.Scatter(x=df.index, y=df['20MA'], line=dict(color='deepskyblue', width=1), name=f'20MA: {latest["20MA"]:.2f}'), row=1, col=1)
@@ -299,37 +329,46 @@ with st.spinner('正在同步證交所官方 OpenAPI 數據、計算指標與 AI
         except Exception:
             continue
 
-        # === 🌟 價格與漲跌來源：大盤用證交所 Summary，個股/ETF 改抓證交所官方 STOCK_DAY_ALL OpenAPI ===
+        price_val = None
+        diff_val = 0.0
+        pct_val = 0.0
+
+        # === 🌟 1. 大盤優先取證交所 Summary ===
         if name == "大盤" and twse_summary.get("index") is not None:
-            current_price = twse_summary["index"]
-            diff_amount = twse_summary["diff"]
-            pct = twse_summary["pct"]
-            prices[name] = round(current_price, 2)
-            changes[name] = {"amount": diff_amount, "pct": pct}
+            price_val = twse_summary["index"]
+            diff_val = twse_summary["diff"] or 0.0
+            pct_val = twse_summary["pct"] or 0.0
         else:
-            # 從證交所 STOCK_DAY_ALL 抓取對應代號 (例如 0052, 00830, 00662)
-            code_str = name # 剛好鍵名就是代號
-            stock_info = twse_stock_day.get(code_str, {})
-            
-            close_str = stock_info.get("ClosingPrice", "").replace(",", "")
-            change_str = stock_info.get("Change", "").replace(",", "")
-            
-            if close_str:
-                current_price = float(close_str)
-                diff_amount = float(change_str) if change_str else 0.0
-                prev_close = current_price - diff_amount
-                pct_val = (diff_amount / prev_close * 100) if prev_close > 0 else 0.0
-                
-                prices[name] = round(current_price, 2)
-                changes[name] = {"amount": round(diff_amount, 2), "pct": round(pct_val, 2)}
+            # === 🌟 2. 個股/ETF 優先嘗試 Fugle 即時 API ===
+            fugle_res = fetch_fugle_quote(name, fugle_token) if fugle_token else None
+            if fugle_res:
+                price_val = fugle_res["price"]
+                diff_val = fugle_res["amount"]
+                pct_val = fugle_res["pct"]
             else:
-                # 最終安全防線 (若證交所 OpenAPI 暫時沒抓到)
-                current_price = float(df['Close'].iloc[-1])
-                prev_close = float(df['Close'].iloc[-2]) if len(df) >= 2 else current_price
-                diff_amount = current_price - prev_close
-                pct_val = (diff_amount / prev_close * 100) if prev_close > 0 else 0.0
-                prices[name] = round(current_price, 2)
-                changes[name] = {"amount": round(diff_amount, 2), "pct": round(pct_val, 2)}
+                # === 🌟 3. 次要嘗試證交所 STOCK_DAY_ALL OpenAPI ===
+                stock_info = twse_stock_day.get(name, {})
+                close_num = safe_float(stock_info.get("ClosingPrice"))
+                change_num = safe_float(stock_info.get("Change"))
+
+                if close_num is not None:
+                    price_val = close_num
+                    diff_val = change_num if change_num is not None else 0.0
+                    prev_close = price_val - diff_val
+                    pct_val = (diff_val / prev_close * 100) if prev_close > 0 else 0.0
+                else:
+                    # === 🌟 4. 保底備援：使用 yfinance 歷史 K 線最新收盤價 ===
+                    price_val = float(df['Close'].iloc[-1])
+                    prev_close = float(df['Close'].iloc[-2]) if len(df) >= 2 else price_val
+                    diff_val = price_val - prev_close
+                    pct_val = (diff_val / prev_close * 100) if prev_close > 0 else 0.0
+
+        if price_val is not None:
+            prices[name] = round(price_val, 2)
+            changes[name] = {"amount": round(diff_val, 2), "pct": round(pct_val, 2)}
+            
+            # 同步更新歷史 DataFrame 的最新收盤價，確保 K 線圖與指標（MA/KD）與卡片價格完全一致
+            df.iloc[-1, df.columns.get_loc('Close')] = price_val
 
         df = compute_indicators(df)
         history_dfs[name] = df
@@ -410,7 +449,7 @@ with st.spinner('正在同步證交所官方 OpenAPI 數據、計算指標與 AI
         render_kd(k_col3, "00830", kd_data["00830"])
         render_kd(k_col4, "00662", kd_data["00662"])
 
-        st.caption(f"{'🔴 盤中即時更新中（以 Fugle v1.0 數據為主）' if is_market_open() else '⚪ 目前非交易時間，顯示為最後收盤資料'}")
+        st.caption(f"{'🔴 盤中即時更新中' if is_market_open() else '⚪ 目前非交易時間，顯示為最後收盤資料'}")
         st.markdown("---")
 
         st.sidebar.markdown("---")
