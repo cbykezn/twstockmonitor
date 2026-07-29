@@ -72,6 +72,7 @@ FUGLE_SYMBOL_MAP = {
     "00830": "00830",
 }
 
+# WebSocket 資料儲存區 (執行緒安全)
 from threading import Lock
 _fugle_store = {"data": {}, "lock": Lock()}
 
@@ -132,6 +133,7 @@ def start_fugle_ws(symbols: List[str], token: str):
         auth_msg = json.dumps({"event": "auth", "apikey": token})
         ws.send(auth_msg)
         time.sleep(0.5)
+        
         for s in symbols:
             try:
                 sub_msg = json.dumps({
@@ -161,6 +163,7 @@ def start_fugle_ws(symbols: List[str], token: str):
                     price = payload.get("close") or payload.get("price")
                     vol = payload.get("totalAmount") if target_key == "大盤" else payload.get("totalVolume")
                     tm = payload.get("time") or payload.get("timestamp")
+                    
                     if price:
                         current_data = fugle_store_get_all().get(target_key, {})
                         new_data = {
@@ -186,7 +189,7 @@ def start_fugle_ws(symbols: List[str], token: str):
     return t
 
 # -------------------------
-# Fugle v1.0 REST API (盤中備援)
+# Fugle v1.0 REST API (避免開盤瞬間WS沒資料的備援)
 # -------------------------
 def fetch_fugle_intraday(symbol: str, token: str) -> Dict[str, Any]:
     if not token:
@@ -217,7 +220,7 @@ def fetch_fugle_intraday(symbol: str, token: str) -> Dict[str, Any]:
         return {"error": str(e)}
 
 # -------------------------
-# TWSE 官方大盤 API (證交所盤後結算成交量備援)
+# TWSE 官方大盤 API (每日成交量與 20日均量)
 # -------------------------
 @st.cache_data(ttl=60)
 def fetch_twse_market_turnover():
@@ -234,6 +237,45 @@ def fetch_twse_market_turnover():
         return None, "API Error"
     except Exception as e:
         return None, str(e)
+
+@st.cache_data(ttl=3600)  # 1小時快取一次即可，減輕證交所負擔
+def fetch_twse_historical_turnover_20d():
+    """ 自動計算證交所官方近 20 個交易日的「真實平均成交金額」 """
+    try:
+        today = datetime.now(TW_TZ)
+        date_this_month = today.strftime("%Y%m%d")
+        last_month_dt = today.replace(day=1) - timedelta(days=1)
+        date_last_month = last_month_dt.strftime("%Y%m%d")
+        
+        headers = {'User-Agent': 'Mozilla/5.0'}
+        
+        # 抓取本月
+        url_this = f"https://www.twse.com.tw/exchangeReport/FMTQIK?response=json&date={date_this_month}"
+        res_this = requests.get(url_this, headers=headers, timeout=10).json()
+        data_this = res_this.get('data', [])
+        
+        # 如果本月交易日不足 20 天，回溯抓取上個月
+        if len(data_this) < 20:
+            time.sleep(1) # 禮貌性延遲
+            url_last = f"https://www.twse.com.tw/exchangeReport/FMTQIK?response=json&date={date_last_month}"
+            res_last = requests.get(url_last, headers=headers, timeout=10).json()
+            data_last = res_last.get('data', [])
+            combined = data_last + data_this
+        else:
+            combined = data_this
+            
+        if not combined:
+            return 4500.0, "無資料"
+            
+        # 切片取最新 20 筆
+        last_20 = combined[-20:]
+        turnover_list = [float(row[2].replace(',', '')) for row in last_20]
+        
+        avg_amt = sum(turnover_list) / len(turnover_list)
+        avg_yi = round(avg_amt / 100000000.0, 2)
+        return avg_yi, "Success"
+    except Exception as e:
+        return 4500.0, f"Error: {e}"
 
 # -------------------------
 # 運算指標與 K 線圖繪製
@@ -339,12 +381,14 @@ with st.spinner('正在同步數據、計算 KD 指標與最新報價...'):
             diff_amount = df['Close'].iloc[-1] - df['Close'].iloc[-2]
             changes[name] = {"amount": diff_amount, "pct": (diff_amount / df['Close'].iloc[-2]) * 100}
 
+        # 將今日即時價格寫入歷史K線，確保當天日K與均線準確
         today = datetime.now(TW_TZ).date()
         if current_price is not None and df.index[-1].date() == today:
             df.loc[df.index[-1], "Close"] = current_price
             df.loc[df.index[-1], "High"] = max(df["High"].iloc[-1], current_price)
             df.loc[df.index[-1], "Low"] = min(df["Low"].iloc[-1], current_price)
 
+        # 計算指標
         df = compute_indicators(df)
         history_dfs[name] = df
         ma20_now[name] = round(df['20MA'].iloc[-1], 2)
@@ -355,7 +399,7 @@ with st.spinner('正在同步數據、計算 KD 指標與最新報價...'):
     twse_vol, twse_msg = fetch_twse_market_turnover()
     fugle_twii_vol = realtime_quotes.get("大盤", {}).get("volume")
     
-    # Fugle 如果有抓到金額，且大於 1,000,000 (代表不是異常的空值或張數)，就換算為億
+    # 判斷目前使用的即時成交量
     if fugle_twii_vol and fugle_twii_vol > 1000000:
         final_daily_volume = round(fugle_twii_vol / 100000000.0, 2)
         vol_source = "Fugle盤中即時"
@@ -365,6 +409,9 @@ with st.spinner('正在同步數據、計算 KD 指標與最新報價...'):
     else:
         final_daily_volume = 3200.0
         vol_source = "手動預設"
+        
+    # === 計算官方 20 日均量 ===
+    twse_20d_avg, twse_20d_msg = fetch_twse_historical_turnover_20d()
 
     if len(prices) == 4:
         st.sidebar.header("⚙️ 參數設定與盤中觀察")
@@ -385,14 +432,17 @@ with st.spinner('正在同步數據、計算 KD 指標與最新報價...'):
         st.sidebar.markdown("---")
         st.sidebar.write("📌 **大盤量能基準設定**")
         
-        # 捨棄不準確的 Yahoo 股數換算，直接讓你設定這陣子的「常態日均量(億)」作為基準
-        avg_vol_20 = st.sidebar.number_input("近期常態日均量 (億) 參考", value=4500.0, step=100.0)
-        st.sidebar.caption("💡 用來計算 60%~70% 的窒息量閾值。")
-        
+        # 預設帶入官方算出來的 20 日均量，保留手動調整彈性
+        avg_vol_20 = st.sidebar.number_input("官方近 20 日均量 (億)", value=float(twse_20d_avg), step=100.0)
+        if twse_20d_msg == "Success":
+            st.sidebar.caption("✅ 已自動同步 TWSE 官方近 20 交易日均量")
+        else:
+            st.sidebar.caption(f"⚠️ 官方均量同步失敗，使用預設值 ({twse_20d_msg})")
+
         daily_volume = st.sidebar.number_input(f"今日大盤成交量 ({vol_source}) 億", value=float(final_daily_volume), step=50.0, format="%.2f")
         
         twse_vol_display = format_volume(twse_vol) if twse_vol else "尚未公布或抓取失敗"
-        st.sidebar.info(f"🏛️ **官方(證交所)盤後結算量**\n\n📌 **{twse_vol_display}**")
+        st.sidebar.info(f"🏛️ **官方(證交所)最新結算量**\n\n📌 **{twse_vol_display}**")
 
         vol_text = f"今日成交: {format_volume(daily_volume)}"
 
@@ -425,10 +475,10 @@ with st.spinner('正在同步數據、計算 KD 指標與最新報價...'):
         candle_shape = st.sidebar.selectbox("今日大盤 K 線型態", ["實體黑K", "實體紅K", "長下影線", "W底成型", "放量長紅"])
         weeks_passed = st.sidebar.slider("距離 7/29 已過幾週？", 0, 8, 0)
 
-        # 條件 1：大盤跌到 36k-38k，或 00830/00662 其中之一未實現損益率 <= -15%
+        # 條件 1：大盤跌到 36k-38k，或 00830/00662 帳面損益 <= -15%
         cond1 = (36000 <= prices["大盤"] <= 38000) or (loss_830 <= -15.0) or (loss_662 <= -15.0)
         
-        # 條件 2：成交量 <= 3500億 或 低於近20日均量的70%，且沒有再創新低
+        # 條件 2：成交量 <= 3500億，或低於近20日均量的70%，且沒有再創新低
         cond_volume_shrink = (daily_volume <= 3500) or (daily_volume <= avg_vol_20 * 0.7)
         cond2 = cond_volume_shrink and stage2_no_new_low
         
@@ -452,7 +502,7 @@ with st.spinner('正在同步數據、計算 KD 指標與最新報價...'):
         
         render_card(c1, "1. 空間的極致", cond1, 
                     f"已達防禦區間！\n大盤: {prices['大盤']:,.0f}\n00830 損益: {loss_830}%\n00662 損益: {loss_662}%", 
-                    f"未達防禦深度\n大盤: {prices['大盤']:,.0f}\n最深損益尚未達 -15%")
+                    f"未達防禦深度\n大盤: {prices['大盤']:,.0f}\n最深損益未達 -15%")
                     
         render_card(c2, "2. 量能的窒息", cond2, 
                     f"賣壓枯竭，籌碼乾淨！\n成交量: {format_volume(daily_volume)}\n未創新低: 是", 
