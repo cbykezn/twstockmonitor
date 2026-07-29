@@ -198,7 +198,7 @@ def analyze_kline_with_gemini(df_recent_json: str, api_key: str, date_str: str) 
         **📊 盤勢解析**：[填入精簡分析]
         """
         
-        models_to_try = ['gemini-1.5-flash', 'gemini-1.5-flash-latest', 'gemini-pro']
+        models_to_try = ['gemini-3.6-flash']
         last_error = ""
         for m_name in models_to_try:
             try:
