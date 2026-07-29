@@ -66,9 +66,9 @@ def format_volume(yi):
 # Fugle symbol mapping (your monitored symbols)
 # -------------------------
 FUGLE_SYMBOL_MAP = {
-    "0052": "TW.0052",
-    "00662": "TW.00662",
-    "00830": "TW.00830",
+    "0052": "0052",
+    "00662": "00662",
+    "00830": "00830",
 }
 
 # thread-safe store for WS
