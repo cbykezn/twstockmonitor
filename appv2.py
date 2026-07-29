@@ -143,7 +143,7 @@ def analyze_kline_with_gemini(df_recent_json: str, api_key: str, date_str: str) 
         return "⚠️ 請在 secrets.toml 設定 GEMINI_API_KEY，即可啟用 AI 自動判斷 K 線型態與盤勢解析。"
     try:
         genai.configure(api_key=api_key)
-        model = genai.GenerativeModel('gemini-1.5-flash')
+        model = genai.GenerativeModel('gemini-3.6-flash')
         prompt = f"""
         你是一位專業的台股技術分析師。現在的日期是 {date_str}。
         這是我提供的台股加權指數近 10 個交易日的 OHLCV 報價（JSON格式，日期為鍵值，包含開、高、低、收、量）：
