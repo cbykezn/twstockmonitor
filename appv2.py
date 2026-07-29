@@ -385,11 +385,9 @@ with st.spinner('正在同步數據、計算 KD 指標與最新報價...'):
         st.sidebar.markdown("---")
         st.sidebar.write("📌 **大盤量能基準設定**")
         
-        # 讓系統自動抓取前 20 天的歷史成交股數，並換算為預估的億元均量
-        auto_avg_vol_20 = round(history_dfs["大盤"]['Volume'].tail(20).mean() / 100000.0, 2)
-        
-        # 將自動算好的數字變成預設值帶入 (也保留了手動微調的彈性)
-        avg_vol_20 = st.sidebar.number_input("大盤近 20 日均量 (億) 參考", value=float(auto_avg_vol_20), step=100.0)
+        # 捨棄不準確的 Yahoo 股數換算，直接讓你設定這陣子的「常態日均量(億)」作為基準
+        avg_vol_20 = st.sidebar.number_input("近期常態日均量 (億) 參考", value=4500.0, step=100.0)
+        st.sidebar.caption("💡 用來計算 60%~70% 的窒息量閾值。")
         
         daily_volume = st.sidebar.number_input(f"今日大盤成交量 ({vol_source}) 億", value=float(final_daily_volume), step=50.0, format="%.2f")
         
