@@ -52,7 +52,7 @@ def format_volume(yi):
 
 
 def safe_float(val: Any) -> Optional[float]:
-    """ 安全轉換浮點數，處理 --, None, 逗號字串 """
+    """ 安全轉換浮點數 """
     if val is None:
         return None
     val_str = str(val).replace(",", "").strip()
@@ -77,7 +77,6 @@ FUGLE_BASE_URL = "https://api.fugle.tw/marketdata/v1.0/stock"
 
 
 class FugleRateLimiter:
-    """ 全域滑動視窗限流器 """
     def __init__(self, max_calls: int = 58, period: float = 60.0):
         self.max_calls = max_calls
         self.period = period
@@ -140,10 +139,9 @@ def fetch_fugle_prev_close(symbol_code: str, token: str, cache_date: str) -> Opt
 
 @st.cache_data(ttl=180, show_spinner=False)
 def fetch_fugle_intraday_candles(symbol_code: str, token: str, timeframe: str, refresh_bucket: int) -> Optional[pd.DataFrame]:
-    """ 抓取富果即時分 K，修復 API 參數大小寫錯誤 """
     data = fugle_api_get(
         f"/intraday/candles/{symbol_code}", token,
-        params={"timeFrame": timeframe}, # 修正：Fugle 官方參數為駝峰式的 timeFrame
+        params={"timeFrame": timeframe},
     )
     if not data or not data.get("data"):
         return None
@@ -159,13 +157,11 @@ def fetch_fugle_intraday_candles(symbol_code: str, token: str, timeframe: str, r
 
 @st.cache_data(ttl=180, show_spinner=False)
 def fetch_yf_intraday_candles(symbol: str, refresh_bucket: int) -> Optional[pd.DataFrame]:
-    """ 🌟 全新備援：若富果無法取得，抓取 Yahoo Finance 的 1 分鐘即時 K 線 """
     try:
         ticker = yf.Ticker(symbol, session=YF_SESSION) if YF_SESSION else yf.Ticker(symbol)
         df = ticker.history(period="1d", interval="1m")
         if df.empty:
             return None
-        # 轉換成小寫欄位以符合畫圖函式需求
         df = df.rename(columns={"Open": "open", "High": "high", "Low": "low", "Close": "close", "Volume": "volume"})
         if df.index.tz is None:
             df.index = df.index.tz_localize('UTC').tz_convert(TW_TZ)
@@ -181,16 +177,18 @@ def fetch_yf_intraday_candles(symbol: str, refresh_bucket: int) -> Optional[pd.D
 # -------------------------
 def fetch_twse_price(stock_id: str) -> Optional[float]:
     try:
-        url = f"https://mis.twse.com.tw/stock/api/getStockInfo.jsp?ex_ch=tse_{stock_id}.tw"
-        headers = {'User-Agent': 'Mozilla/5.0'}
-        res = requests.get(url, headers=headers, timeout=4)
-        if res.status_code == 200:
-            data = res.json()
-            if 'msgArray' in data and len(data['msgArray']) > 0:
-                info = data['msgArray'][0]
-                price_val = safe_float(info.get('z')) or safe_float(info.get('y'))
-                if price_val and price_val > 0:
-                    return price_val
+        # 嘗試先抓 tse (上市)，若失敗再抓 otc (上櫃)，避免 ETF 抓不到
+        for market in ["tse", "otc"]:
+            url = f"https://mis.twse.com.tw/stock/api/getStockInfo.jsp?ex_ch={market}_{stock_id}.tw"
+            headers = {'User-Agent': 'Mozilla/5.0'}
+            res = requests.get(url, headers=headers, timeout=2)
+            if res.status_code == 200:
+                data = res.json()
+                if 'msgArray' in data and len(data['msgArray']) > 0:
+                    info = data['msgArray'][0]
+                    price_val = safe_float(info.get('z')) or safe_float(info.get('y'))
+                    if price_val and price_val > 0:
+                        return price_val
     except Exception:
         pass
     return None
@@ -263,8 +261,8 @@ def analyze_kline_with_gemini(df_recent_json: str, api_key: str, date_str: str) 
         **📌 今日 K 線型態**：[填入型態]
         **📊 盤勢解析**：[填入精簡分析]
         """
-        # 修正：更新為正確存在的模型名稱
-        models_to_try = ['gemini-1.5-flash', 'gemini-1.5-flash-latest', 'gemini-pro']
+        # 依需求加入 gemini-3.6-flash 測試
+        models_to_try = ['gemini-3.6-flash', 'gemini-1.5-flash', 'gemini-1.5-flash-latest']
         last_error = ""
         for m_name in models_to_try:
             try:
@@ -376,53 +374,27 @@ def draw_professional_chart(df, title_name):
     return fig
 
 
-def draw_intraday_index_chart(df_candles: Optional[pd.DataFrame], prev_close: Optional[float], title_name: str, source_label: str) -> go.Figure:
+def draw_intraday_line_chart(df_candles: Optional[pd.DataFrame], prev_close: Optional[float], title_name: str, source_label: str) -> go.Figure:
+    """ 全面改用即時走勢折線圖 """
     fig = go.Figure()
     if df_candles is not None and not df_candles.empty:
         line_color = "#FF3333" if (prev_close and df_candles['close'].iloc[-1] >= prev_close) else "#00AA00"
         fig.add_trace(go.Scatter(
             x=df_candles.index, y=df_candles['close'],
-            mode='lines', name='即時指數',
-            line=dict(color=line_color, width=1.8),
+            mode='lines', name='即時走勢',
+            line=dict(color=line_color, width=2.0),
         ))
         if prev_close:
             fig.add_hline(y=prev_close, line_dash="dot", line_color="gray",
                           annotation_text=f"昨收 {prev_close:,.2f}", annotation_position="top left")
     else:
-        fig.add_annotation(text="尚無即時分K資料 (富果與Yahoo備援皆無法取得)",
+        fig.add_annotation(text="尚無即時分K資料 (可能為非交易時間或備援失敗)",
                            showarrow=False, font=dict(size=14, color="gray"))
 
     live_tag = f" 🔴 {source_label}" if is_market_open() else f" (收盤 {source_label})"
     fig.update_layout(
-        title=f"📈 {title_name} 今日即時走勢圖{live_tag}",
-        template="plotly_dark", height=320, showlegend=False,
-        margin=dict(l=10, r=10, t=45, b=10),
-    )
-    fig.update_xaxes(tickformat="%H:%M")
-    return fig
-
-
-def draw_intraday_candlestick_chart(df_candles: Optional[pd.DataFrame], title_name: str, timeframe_label: str, source_label: str) -> go.Figure:
-    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.05, row_heights=[0.72, 0.28])
-    if df_candles is not None and not df_candles.empty:
-        fig.add_trace(go.Candlestick(
-            x=df_candles.index, open=df_candles['open'], high=df_candles['high'],
-            low=df_candles['low'], close=df_candles['close'],
-            increasing_line_color='#FF3333', decreasing_line_color='#00AA00', name="K線",
-        ), row=1, col=1)
-        if len(df_candles) >= 5:
-            ma20 = df_candles['close'].rolling(window=min(20, len(df_candles)), min_periods=1).mean()
-            fig.add_trace(go.Scatter(x=df_candles.index, y=ma20, line=dict(color='deepskyblue', width=1), name='20分MA'), row=1, col=1)
-        colors = ['#FF3333' if row['close'] >= row['open'] else '#00AA00' for _, row in df_candles.iterrows()]
-        fig.add_trace(go.Bar(x=df_candles.index, y=df_candles['volume'], marker_color=colors, name="成交量(張)"), row=2, col=1)
-    else:
-        fig.add_annotation(text="尚無即時分K資料 (富果與Yahoo備援皆無法取得)",
-                           showarrow=False, font=dict(size=14, color="gray"))
-
-    live_tag = f" 🔴 {source_label}" if is_market_open() else f" (收盤 {source_label})"
-    fig.update_layout(
-        title=f"📊 {title_name} 當日 K 線 ({timeframe_label}){live_tag}",
-        template="plotly_dark", xaxis_rangeslider_visible=False, height=420,
+        title=f"📈 {title_name} 當日即時走勢圖{live_tag}",
+        template="plotly_dark", height=280, showlegend=False,
         margin=dict(l=10, r=10, t=45, b=10),
     )
     fig.update_xaxes(tickformat="%H:%M")
@@ -459,7 +431,7 @@ else:
 # -------------------------
 tickers = {"大盤": "^TWII", "0052": "0052.TW", "00830": "00830.TW", "00662": "00662.TW"}
 
-with st.spinner('正在同步富果即時行情、Yahoo 備援數據、計算指標與 AI 解析...'):
+with st.spinner('正在同步即時行情、計算指標與 AI 解析...'):
     twse_summary, _ = fetch_twse_summary()
     twse_vol, _ = fetch_twse_market_turnover()
     twse_20d_avg, _ = fetch_twse_historical_turnover_20d()
@@ -486,7 +458,7 @@ with st.spinner('正在同步富果即時行情、Yahoo 備援數據、計算指
         diff_val = 0.0
         pct_val = 0.0
 
-        # === 🌟 抓取分 K 資料 (專供下方即時圖表使用，包含無縫 Yahoo 備援) ===
+        # === 🌟 抓取分 K 資料 (供下方即時圖表使用) ===
         fugle_candles = None
         if fugle_token:
             fugle_candles = fetch_fugle_intraday_candles(fugle_symbol, fugle_token, "1", _refresh_bucket)
@@ -499,9 +471,10 @@ with st.spinner('正在同步富果即時行情、Yahoo 備援數據、計算指
             intraday_dfs[name] = yf_candles
             chart_sources[name] = "Yahoo 備援" if yf_candles is not None else "無法取得"
 
-        # === 抓取最新股價 (專供卡片指標使用) ===
+        # === 抓取最新股價 ===
         prev_close_fugle = fetch_fugle_prev_close(fugle_symbol, fugle_token, today_str) if fugle_token else None
 
+        # 強制鎖定富果最新收盤價
         if chart_sources[name] == "富果即時" and prev_close_fugle:
             price_val = float(intraday_dfs[name]['close'].iloc[-1])
             diff_val = price_val - prev_close_fugle
@@ -512,7 +485,7 @@ with st.spinner('正在同步富果即時行情、Yahoo 備援數據、計算指
             price_val = twse_summary["index"]
             diff_val = twse_summary["diff"] or 0.0
             pct_val = twse_summary["pct"] or 0.0
-            intraday_source[name] = intraday_source.get(name) or "twse"
+            intraday_source[name] = "twse"
             intraday_prev_close[name] = price_val - diff_val
         elif name != "大盤":
             twse_mis_price = fetch_twse_price(name)
@@ -522,21 +495,21 @@ with st.spinner('正在同步富果即時行情、Yahoo 備援數據、計算指
                 prev_close_ref = prev_close_fugle or prev_close_yf or price_val
                 diff_val = price_val - prev_close_ref
                 pct_val = (diff_val / prev_close_ref * 100) if prev_close_ref > 0 else 0.0
-                intraday_source[name] = intraday_source.get(name) or "twse_mis"
+                intraday_source[name] = "twse_mis"
                 intraday_prev_close[name] = prev_close_ref
             else:
                 price_val = float(df['Close'].iloc[-1])
                 prev_close_ref = prev_close_fugle or prev_close_yf or price_val
                 diff_val = price_val - prev_close_ref
                 pct_val = (diff_val / prev_close_ref * 100) if prev_close_ref > 0 else 0.0
-                intraday_source[name] = intraday_source.get(name) or "yfinance"
+                intraday_source[name] = "yfinance"
                 intraday_prev_close[name] = prev_close_ref
         else:
             price_val = float(df['Close'].iloc[-1])
             prev_close_yf = float(df['Close'].iloc[-2]) if len(df) >= 2 else price_val
             diff_val = price_val - prev_close_yf
             pct_val = (diff_val / prev_close_yf * 100) if prev_close_yf > 0 else 0.0
-            intraday_source[name] = intraday_source.get(name) or "yfinance"
+            intraday_source[name] = "yfinance"
             intraday_prev_close[name] = prev_close_yf
 
         if price_val is not None:
@@ -614,10 +587,10 @@ with st.spinner('正在同步富果即時行情、Yahoo 備援數據、計算指
         col4.metric(f"📦 00662 (損益: {loss_662}%) {_source_tag.get(intraday_source.get('00662'), '')}", f"{prices['00662']}", f"{changes['00662']['amount']:+.2f} ({changes['00662']['pct']:+.2f}%)", delta_color="inverse")
 
         # -------------------------
-        # 🌟 大盤當日即時走勢圖
+        # 🌟 即時走勢圖 (全部改為折線圖)
         # -------------------------
         st.plotly_chart(
-            draw_intraday_index_chart(intraday_dfs.get("大盤"), intraday_prev_close.get("大盤"), "加權指數", chart_sources.get("大盤", "無資料")),
+            draw_intraday_line_chart(intraday_dfs.get("大盤"), intraday_prev_close.get("大盤"), "加權指數", chart_sources.get("大盤", "無資料")),
             use_container_width=True,
         )
 
@@ -637,17 +610,14 @@ with st.spinner('正在同步富果即時行情、Yahoo 備援數據、計算指
         st.caption(f"{'🔴 盤中即時更新中' if is_market_open() else '⚪ 目前非交易時間，顯示為最後收盤資料'}")
         st.markdown("---")
 
-        # -------------------------
-        # 🌟 三檔 ETF 當日即時 K 線圖
-        # -------------------------
-        st.subheader("📊 三檔 ETF 當日即時 K 線")
+        st.subheader("📊 三檔 ETF 當日即時走勢")
         etf_col1, etf_col2, etf_col3 = st.columns(3)
         with etf_col1:
-            st.plotly_chart(draw_intraday_candlestick_chart(intraday_dfs.get("0052"), "0052", "1分K", chart_sources.get("0052", "無資料")), use_container_width=True)
+            st.plotly_chart(draw_intraday_line_chart(intraday_dfs.get("0052"), intraday_prev_close.get("0052"), "0052", chart_sources.get("0052", "無資料")), use_container_width=True)
         with etf_col2:
-            st.plotly_chart(draw_intraday_candlestick_chart(intraday_dfs.get("00830"), "00830", "1分K", chart_sources.get("00830", "無資料")), use_container_width=True)
+            st.plotly_chart(draw_intraday_line_chart(intraday_dfs.get("00830"), intraday_prev_close.get("00830"), "00830", chart_sources.get("00830", "無資料")), use_container_width=True)
         with etf_col3:
-            st.plotly_chart(draw_intraday_candlestick_chart(intraday_dfs.get("00662"), "00662", "1分K", chart_sources.get("00662", "無資料")), use_container_width=True)
+            st.plotly_chart(draw_intraday_line_chart(intraday_dfs.get("00662"), intraday_prev_close.get("00662"), "00662", chart_sources.get("00662", "無資料")), use_container_width=True)
         st.markdown("---")
 
         st.sidebar.markdown("---")
