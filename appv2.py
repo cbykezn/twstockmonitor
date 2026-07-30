@@ -1,24 +1,15 @@
 import os
-import json
 import time
 import threading
 import requests
-import traceback
 import streamlit as st
 import yfinance as yf
 import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
+from collections import deque
 from datetime import datetime, timezone, timedelta
-from typing import Tuple, Dict, Any, Optional, List
-
-# websocket-client 載入保護
-try:
-    import websocket
-    WS_AVAILABLE = True
-except Exception:
-    websocket = None
-    WS_AVAILABLE = False
+from typing import Tuple, Any, Optional
 
 # curl_cffi 載入保護
 try:
@@ -40,6 +31,7 @@ st.markdown("---")
 
 TW_TZ = timezone(timedelta(hours=8))
 
+
 def is_market_open():
     now = datetime.now(TW_TZ)
     if now.weekday() >= 5:
@@ -48,17 +40,6 @@ def is_market_open():
     end = now.replace(hour=13, minute=30, second=0, microsecond=0)
     return start <= now <= end
 
-# 自動重新整理設定
-try:
-    from streamlit_autorefresh import st_autorefresh
-    AUTOREFRESH_OK = True
-except Exception:
-    AUTOREFRESH_OK = False
-
-if AUTOREFRESH_OK and is_market_open():
-    st_autorefresh(interval=15_000, limit=None, key="market_autorefresh")
-elif not AUTOREFRESH_OK:
-    st.sidebar.warning("⚠️ 尚未安裝 streamlit-autorefresh，盤中不會自動更新。請執行：pip install streamlit-autorefresh")
 
 def format_volume(yi):
     if yi is None:
@@ -68,6 +49,7 @@ def format_volume(yi):
         return f"{zhao:.2f} 兆元"
     else:
         return f"{yi:,.2f} 億元"
+
 
 def safe_float(val: Any) -> Optional[float]:
     """ 安全轉換浮點數，處理 --, None, 逗號字串 """
@@ -81,28 +63,122 @@ def safe_float(val: Any) -> Optional[float]:
     except ValueError:
         return None
 
-# -------------------------
-# 🌟 預設真實正確股價字典 (備援機制)
-# -------------------------
-DEFAULT_PRICES = {
-    "0052": 0,
-    "00662": 0,
-    "00830": 0
-}
 
 # -------------------------
-# 🌟 Fugle & TWSE 即時 API
+# 🌟 富果 (Fugle) 即時行情整合
 # -------------------------
+# 對照表：面板內部名稱 -> 富果 API 代碼 (大盤採用加權指數 IX0001，注意不要跟報酬指數 IR0001 搞混)
 FUGLE_SYMBOL_MAP = {
     "大盤": "IX0001",
     "0052": "0052",
     "00662": "00662",
     "00830": "00830",
 }
+FUGLE_BASE_URL = "https://api.fugle.tw/marketdata/v1.0/stock"
 
-from threading import Lock
-_fugle_store = {"data": {}, "lock": Lock()}
 
+class FugleRateLimiter:
+    """
+    全域滑動視窗限流器：確保『整個 App 進程』(所有分頁/所有使用者共用) 每 60 秒內
+    呼叫富果 API 的次數不超過 max_calls。搭配 st.cache_resource 讓同一個 process
+    內的所有 session 共用同一顆限流器，避免多分頁同時開啟時把額度用爆。
+    """
+
+    def __init__(self, max_calls: int = 58, period: float = 60.0):
+        # 58 而非 60：刻意保留 2 次緩衝，避免時間誤差導致真的觸頂 429
+        self.max_calls = max_calls
+        self.period = period
+        self._calls = deque()
+        self._lock = threading.Lock()
+
+    def acquire(self):
+        while True:
+            with self._lock:
+                now = time.monotonic()
+                while self._calls and now - self._calls[0] > self.period:
+                    self._calls.popleft()
+                if len(self._calls) < self.max_calls:
+                    self._calls.append(now)
+                    return
+                sleep_for = self.period - (now - self._calls[0]) + 0.05
+            time.sleep(max(sleep_for, 0.05))
+
+    def usage(self) -> Tuple[int, int]:
+        with self._lock:
+            now = time.monotonic()
+            while self._calls and now - self._calls[0] > self.period:
+                self._calls.popleft()
+            return len(self._calls), self.max_calls
+
+
+@st.cache_resource
+def get_fugle_rate_limiter():
+    return FugleRateLimiter(max_calls=58, period=60.0)
+
+
+def fugle_api_get(path: str, token: str, params: Optional[dict] = None, timeout: float = 4.0) -> Optional[dict]:
+    """ 所有富果 API 呼叫的唯一入口，統一經過限流器節流 """
+    if not token:
+        return None
+    get_fugle_rate_limiter().acquire()
+    try:
+        res = requests.get(
+            f"{FUGLE_BASE_URL}{path}",
+            headers={"X-API-KEY": token},
+            params=params or {},
+            timeout=timeout,
+        )
+        if res.status_code == 200:
+            return res.json()
+    except Exception:
+        pass
+    return None
+
+
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
+def fetch_fugle_prev_close(symbol_code: str, token: str, cache_date: str) -> Optional[float]:
+    """
+    昨收價一天只會變一次，用 6 小時 ttl 快取，一個交易日對每檔股票只呼叫 1 次，
+    幾乎不佔用 60 次/分鐘的額度。
+    """
+    data = fugle_api_get(f"/intraday/quote/{symbol_code}", token)
+    if not data:
+        return None
+    prev = safe_float(data.get("previousClose"))
+    if prev is None or prev <= 0:
+        return None
+    return prev
+
+
+@st.cache_data(ttl=180, show_spinner=False)
+def fetch_fugle_intraday_candles(symbol_code: str, token: str, timeframe: str, refresh_bucket: int) -> Optional[pd.DataFrame]:
+    """
+    抓當天的分 K 資料 (供即時走勢圖 / 即時 K 線圖使用)。
+    refresh_bucket 是外部依「目前想要的更新頻率」算出來的時間桶：
+    同一個桶內，Streamlit 快取會直接命中，不會真的打 API，
+    藉此把「畫面更新頻率」跟「實際 API 呼叫頻率」脫鉤、達到節流效果。
+    ttl=180 只是保險的記憶體回收機制，真正的節流靠 refresh_bucket。
+    """
+    data = fugle_api_get(
+        f"/intraday/candles/{symbol_code}", token,
+        params={"timeframe": timeframe, "sort": "asc"},
+    )
+    if not data or not data.get("data"):
+        return None
+    df = pd.DataFrame(data["data"])
+    if df.empty:
+        return None
+    df["date"] = pd.to_datetime(df["date"])
+    df = df.set_index("date").sort_index()
+    for col in ["open", "high", "low", "close", "volume", "average"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+    return df
+
+
+# -------------------------
+# 🏛️ 台灣證券交易所 (TWSE) 官方 API － Fugle 無 token / 失效時的備援
+# -------------------------
 def fetch_twse_price(stock_id: str) -> Optional[float]:
     """ 直連台灣證交所即時 API 獲取最新成交價 (z) 或前日收盤價 (y) """
     try:
@@ -120,24 +196,6 @@ def fetch_twse_price(stock_id: str) -> Optional[float]:
         pass
     return None
 
-def fetch_fugle_quote(symbol_code: str, token: str) -> Optional[Dict[str, float]]:
-    """ 嘗試透過 Fugle REST API 抓取即時報價 """
-    if not token:
-        return None
-    try:
-        url = f"https://api.fugle.tw/marketdata/v1.0/stock/intraday/quote/{symbol_code}"
-        headers = {"X-API-KEY": token}
-        res = requests.get(url, headers=headers, timeout=3)
-        if res.status_code == 200:
-            data = res.json()
-            close_p = safe_float(data.get("closePrice") or data.get("lastPrice"))
-            change_p = safe_float(data.get("change")) or 0.0
-            pct_p = safe_float(data.get("changePercent")) or 0.0
-            if close_p is not None:
-                return {"price": close_p, "amount": change_p, "pct": pct_p}
-    except Exception:
-        pass
-    return None
 
 # -------------------------
 # 讀取 Token (Fugle & Gemini)
@@ -145,7 +203,7 @@ def fetch_fugle_quote(symbol_code: str, token: str) -> Optional[Dict[str, float]
 def get_api_tokens():
     fugle_tok = None
     gemini_tok = None
-    
+
     try:
         secrets = st.secrets
         for k, v in secrets.items():
@@ -172,12 +230,22 @@ def get_api_tokens():
 
     return fugle_tok, gemini_tok
 
+
 fugle_token, gemini_api_key = get_api_tokens()
+
+# 自動重新整理設定 (實際間隔會在側邊欄設定完 refresh_interval_seconds 後再決定)
+try:
+    from streamlit_autorefresh import st_autorefresh
+    AUTOREFRESH_OK = True
+except Exception:
+    AUTOREFRESH_OK = False
+    st.sidebar.warning("⚠️ 尚未安裝 streamlit-autorefresh，盤中不會自動更新。請執行：pip install streamlit-autorefresh")
+
 
 # -------------------------
 # 🤖 Gemini AI 盤後解析
 # -------------------------
-@st.cache_data(ttl=24*3600)
+@st.cache_data(ttl=24 * 3600)
 def analyze_kline_with_gemini(df_recent_json: str, api_key: str, date_str: str) -> str:
     if not api_key:
         return "⚠️ 請在 secrets.toml 設定 GEMINI_API_KEY，即可啟用 AI 自動判斷 K 線型態與盤勢解析。"
@@ -187,17 +255,17 @@ def analyze_kline_with_gemini(df_recent_json: str, api_key: str, date_str: str) 
         你是一位專業的台股技術分析師。現在的日期是 {date_str}。
         這是我提供的台股加權指數近 10 個交易日的 OHLCV 報價（JSON格式，日期為鍵值，包含開, 高, 低, 收, 量）：
         {df_recent_json}
-        
+
         請根據最新一日的 K 線數據與近 10 日走勢，執行以下任務（請保持客觀、精練）：
         1. 判斷最新一個交易日的「K 線型態」（例如：實體黑K、實體紅K、長下影線、十字線、孕線等）。
         2. 判斷是否有打底跡象（例如 W 底、破底翻等）。
         3. 給出一段 100 字以內的精簡盤勢分析。
-        
+
         請嚴格依照以下 Markdown 格式輸出：
         **📌 今日 K 線型態**：[填入型態]
         **📊 盤勢解析**：[填入精簡分析]
         """
-        
+
         models_to_try = ['gemini-3.6-flash']
         last_error = ""
         for m_name in models_to_try:
@@ -212,8 +280,9 @@ def analyze_kline_with_gemini(df_recent_json: str, api_key: str, date_str: str) 
     except Exception as e:
         return f"❌ AI 設定發生錯誤：{str(e)}"
 
+
 # -------------------------
-# 🏛️ 臺灣證券交易所 OpenAPI 專用區
+# 🏛️ 臺灣證券交易所 OpenAPI 專用區 (大盤備援 + 官方成交量)
 # -------------------------
 @st.cache_data(ttl=10)
 def fetch_twse_summary():
@@ -234,6 +303,7 @@ def fetch_twse_summary():
     except Exception as e:
         return {}, str(e)
 
+
 @st.cache_data(ttl=60)
 def fetch_twse_market_turnover():
     try:
@@ -246,6 +316,7 @@ def fetch_twse_market_turnover():
     except Exception as e:
         return None, str(e)
 
+
 @st.cache_data(ttl=3600)
 def fetch_twse_historical_turnover_20d():
     try:
@@ -253,20 +324,22 @@ def fetch_twse_historical_turnover_20d():
         date_this = today.strftime("%Y%m%d")
         date_last = (today.replace(day=1) - timedelta(days=1)).strftime("%Y%m%d")
         headers = {'User-Agent': 'Mozilla/5.0'}
-        
+
         data_this = requests.get(f"https://www.twse.com.tw/exchangeReport/FMTQIK?response=json&date={date_this}", headers=headers, timeout=10).json().get('data', [])
         combined = data_this
         if len(data_this) < 20:
             time.sleep(1)
             data_last = requests.get(f"https://www.twse.com.tw/exchangeReport/FMTQIK?response=json&date={date_last}", headers=headers, timeout=10).json().get('data', [])
             combined = data_last + data_this
-            
-        if not combined: return 4500.0, "無資料"
+
+        if not combined:
+            return 4500.0, "無資料"
         last_20 = combined[-20:]
         avg_yi = round((sum([float(row[2].replace(',', '')) for row in last_20]) / len(last_20)) / 100000000.0, 2)
         return avg_yi, "Success"
     except Exception as e:
         return 4500.0, f"Error: {e}"
+
 
 # -------------------------
 # 指標與圖表
@@ -285,6 +358,7 @@ def compute_indicators(df):
     df['D'] = df['K'].ewm(com=2, adjust=False).mean()
     return df
 
+
 def draw_professional_chart(df, title_name):
     latest = df.iloc[-1]
     fig = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.03, row_heights=[0.6, 0.2, 0.2])
@@ -298,18 +372,102 @@ def draw_professional_chart(df, title_name):
     fig.add_trace(go.Bar(x=df.index, y=df['Volume'], marker_color=colors, name="成交股數"), row=2, col=1)
     fig.add_trace(go.Scatter(x=df.index, y=df['K'], line=dict(color='orange', width=1.2), name=f'K9: {latest["K"]:.2f}'), row=3, col=1)
     fig.add_trace(go.Scatter(x=df.index, y=df['D'], line=dict(color='dodgerblue', width=1.2), name=f'D9: {latest["D"]:.2f}'), row=3, col=1)
-    
+
     live_tag = " 🔴 盤中即時" if is_market_open() else " (收盤資料)"
     fig.update_layout(title=f"📊 {title_name} 專業技術分析圖表 (近一年){live_tag}", template="plotly_dark", xaxis_rangeslider_visible=False, height=750)
     fig.update_xaxes(rangebreaks=[dict(bounds=["sat", "mon"])])
     return fig
+
+
+def draw_intraday_index_chart(df_candles: Optional[pd.DataFrame], prev_close: Optional[float], title_name: str) -> go.Figure:
+    """ 大盤當日即時走勢圖 (折線圖 + 昨收參考線)，資料來源為富果分 K """
+    fig = go.Figure()
+    if df_candles is not None and not df_candles.empty:
+        line_color = "#FF3333" if (prev_close and df_candles['close'].iloc[-1] >= prev_close) else "#00AA00"
+        fig.add_trace(go.Scatter(
+            x=df_candles.index, y=df_candles['close'],
+            mode='lines', name='即時指數',
+            line=dict(color=line_color, width=1.8),
+        ))
+        if prev_close:
+            fig.add_hline(y=prev_close, line_dash="dot", line_color="gray",
+                           annotation_text=f"昨收 {prev_close:,.2f}", annotation_position="top left")
+    else:
+        fig.add_annotation(text="尚無富果即時資料 (可能為非交易時間或 API 未設定)",
+                            showarrow=False, font=dict(size=14, color="gray"))
+
+    live_tag = " 🔴 盤中即時" if is_market_open() else " (今日收盤走勢)"
+    fig.update_layout(
+        title=f"📈 {title_name} 今日即時走勢圖{live_tag}",
+        template="plotly_dark", height=320, showlegend=False,
+        margin=dict(l=10, r=10, t=45, b=10),
+    )
+    fig.update_xaxes(tickformat="%H:%M")
+    return fig
+
+
+def draw_intraday_candlestick_chart(df_candles: Optional[pd.DataFrame], title_name: str, timeframe_label: str) -> go.Figure:
+    """ 個股/ETF 當日即時 K 線圖，資料來源為富果分 K """
+    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.05, row_heights=[0.72, 0.28])
+    if df_candles is not None and not df_candles.empty:
+        fig.add_trace(go.Candlestick(
+            x=df_candles.index, open=df_candles['open'], high=df_candles['high'],
+            low=df_candles['low'], close=df_candles['close'],
+            increasing_line_color='#FF3333', decreasing_line_color='#00AA00', name="K線",
+        ), row=1, col=1)
+        if len(df_candles) >= 5:
+            ma20 = df_candles['close'].rolling(window=min(20, len(df_candles)), min_periods=1).mean()
+            fig.add_trace(go.Scatter(x=df_candles.index, y=ma20, line=dict(color='deepskyblue', width=1), name='20分MA'), row=1, col=1)
+        colors = ['#FF3333' if row['close'] >= row['open'] else '#00AA00' for _, row in df_candles.iterrows()]
+        fig.add_trace(go.Bar(x=df_candles.index, y=df_candles['volume'], marker_color=colors, name="成交量(張)"), row=2, col=1)
+    else:
+        fig.add_annotation(text="尚無富果即時資料 (可能為非交易時間或 API 未設定)",
+                            showarrow=False, font=dict(size=14, color="gray"))
+
+    live_tag = " 🔴 盤中即時" if is_market_open() else " (今日收盤 K 線)"
+    fig.update_layout(
+        title=f"📊 {title_name} 當日 K 線 ({timeframe_label}){live_tag}",
+        template="plotly_dark", xaxis_rangeslider_visible=False, height=420,
+        margin=dict(l=10, r=10, t=45, b=10),
+    )
+    fig.update_xaxes(tickformat="%H:%M")
+    return fig
+
+
+# -------------------------
+# ⚡ 富果 API 即時更新頻率設定 (影響下方所有即時資料的節流節奏)
+# -------------------------
+st.sidebar.header("⚡ 富果 API 即時更新設定")
+refresh_interval_seconds = st.sidebar.slider(
+    "即時資料更新頻率（秒）", min_value=5, max_value=30, value=6, step=1,
+    help="數字越小，走勢圖/K線更新越即時，但會用掉越多富果 API 額度（安全上限 58 次/分鐘，官方硬限 60 次/分鐘）。",
+)
+_FUGLE_SYMBOLS_COUNT = len(FUGLE_SYMBOL_MAP)  # 大盤 + 0052 + 00662 + 00830 = 4
+_est_calls_per_min = round(_FUGLE_SYMBOLS_COUNT * 60 / refresh_interval_seconds, 1)
+_used_calls, _limit_calls = get_fugle_rate_limiter().usage()
+st.sidebar.caption(f"📡 預估用量：約 **{_est_calls_per_min} 次/分鐘**（{_FUGLE_SYMBOLS_COUNT} 檔 × 每輪 1 次分K呼叫）")
+st.sidebar.progress(min(_used_calls / _limit_calls, 1.0), text=f"最近 60 秒實際已呼叫 {_used_calls}/{_limit_calls} 次")
+if _est_calls_per_min > 55:
+    st.sidebar.warning("⚠️ 預估用量已非常接近上限，如遇到 429 請調高更新頻率秒數。")
+if not fugle_token:
+    st.sidebar.info("ℹ️ 尚未偵測到 FUGLE_TOKEN，即時走勢圖／即時K線將自動退回證交所/歷史資料備援。")
+
+if AUTOREFRESH_OK and is_market_open():
+    st_autorefresh(interval=int(refresh_interval_seconds * 1000), limit=None, key="market_autorefresh")
+
+# 分 K 週期只在「市場有開盤」時才貼近 refresh_interval_seconds 節流，
+# 收盤後同一天的K線資料不會再變動，改成 5 分鐘一個時間桶，避免浪費額度。
+if is_market_open():
+    _refresh_bucket = int(time.time() // refresh_interval_seconds)
+else:
+    _refresh_bucket = int(time.time() // 300)
 
 # -------------------------
 # 主程式執行區
 # -------------------------
 tickers = {"大盤": "^TWII", "0052": "0052.TW", "00830": "00830.TW", "00662": "00662.TW"}
 
-with st.spinner('正在同步證交所官方 OpenAPI 數據、計算指標與 AI 解析...'):
+with st.spinner('正在同步富果即時行情、證交所官方 OpenAPI 數據、計算指標與 AI 解析...'):
     twse_summary, _ = fetch_twse_summary()
     twse_vol, _ = fetch_twse_market_turnover()
     twse_20d_avg, _ = fetch_twse_historical_turnover_20d()
@@ -321,49 +479,68 @@ with st.spinner('正在同步證交所官方 OpenAPI 數據、計算指標與 AI
 
     today_str = datetime.now(TW_TZ).strftime("%Y-%m-%d")
     prices, changes, history_dfs, ma20_now, ma20_prev, kd_data = {}, {}, {}, {}, {}, {}
+    intraday_dfs, intraday_prev_close, intraday_source = {}, {}, {}
 
     for name, symbol in tickers.items():
         try:
             df = fetch_history(symbol, today_str)
-            if df.empty: continue
+            if df.empty:
+                continue
         except Exception:
             continue
 
+        fugle_symbol = FUGLE_SYMBOL_MAP.get(name)
         price_val = None
         diff_val = 0.0
         pct_val = 0.0
 
-        if name == "大盤":
-            # 大盤優先取證交所 Summary API
-            if twse_summary.get("index") is not None:
-                price_val = twse_summary["index"]
-                diff_val = twse_summary["diff"] or 0.0
-                pct_val = twse_summary["pct"] or 0.0
+        # === 取價順序：1. 富果即時分K + 昨收 -> 2. 證交所官方 API -> 3. yfinance 最近收盤 ===
+        prev_close_fugle = fetch_fugle_prev_close(fugle_symbol, fugle_token, today_str) if fugle_token else None
+        candles_df = None
+        if fugle_token:
+            candles_df = fetch_fugle_intraday_candles(fugle_symbol, fugle_token, "1", _refresh_bucket)
+
+        intraday_dfs[name] = candles_df
+        intraday_source[name] = "fugle" if candles_df is not None else None
+
+        if candles_df is not None and prev_close_fugle:
+            price_val = float(candles_df['close'].iloc[-1])
+            diff_val = price_val - prev_close_fugle
+            pct_val = (diff_val / prev_close_fugle * 100) if prev_close_fugle > 0 else 0.0
+            intraday_prev_close[name] = prev_close_fugle
+        elif name == "大盤" and twse_summary.get("index") is not None:
+            # 大盤備援：證交所官方即時摘要
+            price_val = twse_summary["index"]
+            diff_val = twse_summary["diff"] or 0.0
+            pct_val = twse_summary["pct"] or 0.0
+            intraday_source[name] = intraday_source[name] or "twse"
+            intraday_prev_close[name] = price_val - diff_val
+        elif name != "大盤":
+            # 個股/ETF 備援：證交所 MIS 即時單檔報價
+            twse_mis_price = fetch_twse_price(name)
+            prev_close_yf = float(df['Close'].iloc[-2]) if len(df) >= 2 else None
+            if twse_mis_price is not None:
+                price_val = twse_mis_price
+                prev_close_ref = prev_close_fugle or prev_close_yf or price_val
+                diff_val = price_val - prev_close_ref
+                pct_val = (diff_val / prev_close_ref * 100) if prev_close_ref > 0 else 0.0
+                intraday_source[name] = intraday_source[name] or "twse_mis"
+                intraday_prev_close[name] = prev_close_ref
             else:
                 price_val = float(df['Close'].iloc[-1])
-                prev_close = float(df['Close'].iloc[-2]) if len(df) >= 2 else price_val
-                diff_val = price_val - prev_close
-                pct_val = (diff_val / prev_close * 100) if prev_close > 0 else 0.0
+                prev_close_ref = prev_close_fugle or prev_close_yf or price_val
+                diff_val = price_val - prev_close_ref
+                pct_val = (diff_val / prev_close_ref * 100) if prev_close_ref > 0 else 0.0
+                intraday_source[name] = intraday_source[name] or "yfinance"
+                intraday_prev_close[name] = prev_close_ref
         else:
-            # === 個股/ETF 取價順序：1. Fugle API -> 2. 證交所 MIS 即時 API -> 3. 正確基準價格 ===
-            fugle_res = fetch_fugle_quote(name, fugle_token) if fugle_token else None
-            twse_mis_price = fetch_twse_price(name) if not fugle_res else None
-
-            if fugle_res:
-                price_val = fugle_res["price"]
-                diff_val = fugle_res["amount"]
-                pct_val = fugle_res["pct"]
-            elif twse_mis_price is not None:
-                price_val = twse_mis_price
-                prev_close = float(df['Close'].iloc[-2]) if len(df) >= 2 else price_val
-                diff_val = price_val - prev_close
-                pct_val = (diff_val / prev_close * 100) if prev_close > 0 else 0.0
-            else:
-                # 保底採用最新正確數值 (0052: 54.40, 00662: 115.15, 00830: 77.75)
-                price_val = DEFAULT_PRICES.get(name, float(df['Close'].iloc[-1]))
-                prev_close = float(df['Close'].iloc[-2]) if len(df) >= 2 else price_val
-                diff_val = price_val - prev_close
-                pct_val = (diff_val / prev_close * 100) if prev_close > 0 else 0.0
+            # 大盤最終備援：yfinance
+            price_val = float(df['Close'].iloc[-1])
+            prev_close_yf = float(df['Close'].iloc[-2]) if len(df) >= 2 else price_val
+            diff_val = price_val - prev_close_yf
+            pct_val = (diff_val / prev_close_yf * 100) if prev_close_yf > 0 else 0.0
+            intraday_source[name] = intraday_source[name] or "yfinance"
+            intraday_prev_close[name] = prev_close_yf
 
         if price_val is not None:
             prices[name] = round(price_val, 2)
@@ -383,7 +560,7 @@ with st.spinner('正在同步證交所官方 OpenAPI 數據、計算指標與 AI
 
     if len(prices) == 4:
         st.sidebar.header("⚙️ 參數設定與盤中觀察")
-        
+
         # 允許使用者在側邊欄微調當前採計股價
         st.sidebar.subheader("📌 股價即時確認/修正")
         prices["0052"] = st.sidebar.number_input("0052 當前股價", value=float(prices["0052"]), step=0.1, format="%.2f")
@@ -398,9 +575,9 @@ with st.spinner('正在同步證交所官方 OpenAPI 數據、計算指標與 AI
         loss_830 = round(((prices["00830"] - cost_830) / cost_830) * 100, 2)
         loss_662 = round(((prices["00662"] - cost_662) / cost_662) * 100, 2)
 
-        # 繪製圖表
+        # 繪製圖表 (近一年日K)
         st.plotly_chart(draw_professional_chart(history_dfs["大盤"], "加權指數 (大盤)"), use_container_width=True)
-        
+
         # 🤖 觸發 Gemini AI 盤後解析
         st.markdown("##### 🤖 Gemini 雙子星 AI 盤後解析")
         if GENAI_AVAILABLE and gemini_api_key:
@@ -411,7 +588,7 @@ with st.spinner('正在同步證交所官方 OpenAPI 數據、計算指標與 AI
                 recent_df = recent_df.round(2)
                 recent_df.index = recent_df.index.strftime('%Y-%m-%d')
                 json_payload = recent_df.to_json(orient="index")
-                
+
                 ai_analysis_result = analyze_kline_with_gemini(json_payload, gemini_api_key, today_str)
                 st.info(ai_analysis_result)
         elif not GENAI_AVAILABLE:
@@ -422,12 +599,12 @@ with st.spinner('正在同步證交所官方 OpenAPI 數據、計算指標與 AI
         st.markdown("---")
 
         col1, col2, col3, col4 = st.columns(4)
-        
+
         st.sidebar.markdown("---")
         st.sidebar.write("📌 **大盤量能基準設定**")
         avg_vol_20 = st.sidebar.number_input("官方近 20 日均量 (億)", value=float(twse_20d_avg), step=100.0)
         daily_volume = st.sidebar.number_input(f"今日大盤成交量 ({vol_source}) 億", value=float(final_daily_volume), step=50.0, format="%.2f")
-        
+
         vol_percentage = (daily_volume / avg_vol_20 * 100) if avg_vol_20 > 0 else 0
         if vol_percentage <= 70:
             st.sidebar.success(f"🔥 **今日量縮比：{vol_percentage:.1f}%**\n\n(小於 70%，已達窒息量標準)")
@@ -439,10 +616,19 @@ with st.spinner('正在同步證交所官方 OpenAPI 數據、計算指標與 AI
 
         vol_text = f"今日成交: {format_volume(daily_volume)}"
 
-        col1.metric(f"📈 大盤指數 ({vol_text})", f"{prices['大盤']:,.2f}", f"{changes['大盤']['amount']:+.2f} 點 ({changes['大盤']['pct']:+.2f}%)", delta_color="inverse")
-        col2.metric(f"📦 0052 (損益: {loss_52}%)", f"{prices['0052']}", f"{changes['0052']['amount']:+.2f} ({changes['0052']['pct']:+.2f}%)", delta_color="inverse")
-        col3.metric(f"📦 00830 (損益: {loss_830}%)", f"{prices['00830']}", f"{changes['00830']['amount']:+.2f} ({changes['00830']['pct']:+.2f}%)", delta_color="inverse")
-        col4.metric(f"📦 00662 (損益: {loss_662}%)", f"{prices['00662']}", f"{changes['00662']['amount']:+.2f} ({changes['00662']['pct']:+.2f}%)", delta_color="inverse")
+        _source_tag = {"fugle": "🟢富果即時", "twse": "🏛️證交所", "twse_mis": "🏛️證交所", "yfinance": "🕒歷史收盤"}
+        col1.metric(f"📈 大盤指數 ({vol_text}) {_source_tag.get(intraday_source.get('大盤'), '')}", f"{prices['大盤']:,.2f}", f"{changes['大盤']['amount']:+.2f} 點 ({changes['大盤']['pct']:+.2f}%)", delta_color="inverse")
+        col2.metric(f"📦 0052 (損益: {loss_52}%) {_source_tag.get(intraday_source.get('0052'), '')}", f"{prices['0052']}", f"{changes['0052']['amount']:+.2f} ({changes['0052']['pct']:+.2f}%)", delta_color="inverse")
+        col3.metric(f"📦 00830 (損益: {loss_830}%) {_source_tag.get(intraday_source.get('00830'), '')}", f"{prices['00830']}", f"{changes['00830']['amount']:+.2f} ({changes['00830']['pct']:+.2f}%)", delta_color="inverse")
+        col4.metric(f"📦 00662 (損益: {loss_662}%) {_source_tag.get(intraday_source.get('00662'), '')}", f"{prices['00662']}", f"{changes['00662']['amount']:+.2f} ({changes['00662']['pct']:+.2f}%)", delta_color="inverse")
+
+        # -------------------------
+        # 🌟 大盤當日即時走勢圖 (富果分K)
+        # -------------------------
+        st.plotly_chart(
+            draw_intraday_index_chart(intraday_dfs.get("大盤"), intraday_prev_close.get("大盤"), "加權指數"),
+            use_container_width=True,
+        )
 
         st.markdown("##### 📉 最新 KD 指標與交叉訊號")
         k_col1, k_col2, k_col3, k_col4 = st.columns(4)
@@ -451,13 +637,26 @@ with st.spinner('正在同步證交所官方 OpenAPI 數據、計算指標與 AI
             color = "orange" if k_val >= d_val else "mediumaquamarine"
             status = "黃金交叉 (K>D)" if k_val >= d_val else "死亡交叉 (K<D)"
             col.markdown(f"**{name}**<br/><span style='color:{color}; font-size:16px;'>K: {k_val} / D: {d_val} ({status})</span>", unsafe_allow_html=True)
-            
+
         render_kd(k_col1, "大盤", kd_data["大盤"])
         render_kd(k_col2, "0052", kd_data["0052"])
         render_kd(k_col3, "00830", kd_data["00830"])
         render_kd(k_col4, "00662", kd_data["00662"])
 
         st.caption(f"{'🔴 盤中即時更新中' if is_market_open() else '⚪ 目前非交易時間，顯示為最後收盤資料'}")
+        st.markdown("---")
+
+        # -------------------------
+        # 🌟 三檔 ETF 當日即時 K 線圖 (富果分K)
+        # -------------------------
+        st.subheader("📊 三檔 ETF 當日即時 K 線")
+        etf_col1, etf_col2, etf_col3 = st.columns(3)
+        with etf_col1:
+            st.plotly_chart(draw_intraday_candlestick_chart(intraday_dfs.get("0052"), "0052", "1分K"), use_container_width=True)
+        with etf_col2:
+            st.plotly_chart(draw_intraday_candlestick_chart(intraday_dfs.get("00830"), "00830", "1分K"), use_container_width=True)
+        with etf_col3:
+            st.plotly_chart(draw_intraday_candlestick_chart(intraday_dfs.get("00662"), "00662", "1分K"), use_container_width=True)
         st.markdown("---")
 
         st.sidebar.markdown("---")
@@ -482,20 +681,20 @@ with st.spinner('正在同步證交所官方 OpenAPI 數據、計算指標與 AI
                 else: st.error(f"### 🔴 鎖定中\n**第 {title} 筆**\n\n{fail_msg}")
 
         c1, c2, c3, c4, c5 = st.columns(5)
-        render_card(c1, "1. 空間的極致", cond1, 
-                    f"已達防禦區間！\n大盤: {prices['大盤']:,.0f}", 
+        render_card(c1, "1. 空間的極致", cond1,
+                    f"已達防禦區間！\n大盤: {prices['大盤']:,.0f}",
                     f"未達防禦深度\n大盤: {prices['大盤']:,.0f}")
-        render_card(c2, "2. 量能的窒息", cond2, 
-                    f"賣壓枯竭，籌碼乾淨！\n量縮比: {vol_percentage:.1f}%", 
+        render_card(c2, "2. 量能的窒息", cond2,
+                    f"賣壓枯竭，籌碼乾淨！\n量縮比: {vol_percentage:.1f}%",
                     f"量縮未滿足\n量縮比: {vol_percentage:.1f}%")
-        render_card(c3, "3. 時間的折磨", cond3, 
-                    f"底部承接力道確認！\n已過 {weeks_passed} 週", 
+        render_card(c3, "3. 時間的折磨", cond3,
+                    f"底部承接力道確認！\n已過 {weeks_passed} 週",
                     f"時間未到或破底\n已過 {weeks_passed} 週")
-        render_card(c4, "4. 型態的確認", cond4, 
-                    f"第二隻腳打底完成！\n型態: {candle_shape}", 
+        render_card(c4, "4. 型態的確認", cond4,
+                    f"第二隻腳打底完成！\n型態: {candle_shape}",
                     f"打底型態未確認\n型態: {candle_shape}")
-        render_card(c5, "5. 趨勢的反轉", cond5, 
-                    f"消化完成，多頭啟動！\n三者站上且月線上揚", 
+        render_card(c5, "5. 趨勢的反轉", cond5,
+                    f"消化完成，多頭啟動！\n三者站上且月線上揚",
                     f"右側趨勢未確認\n均線未全面站上或上揚")
 
         st.markdown("---")
@@ -504,3 +703,5 @@ with st.spinner('正在同步證交所官方 OpenAPI 數據、計算指標與 AI
             st.info(f"🚨 **執行紀律：已有 {triggered_count} 筆資金達成觸發條件。請冷酷執行對應部位的進場！**")
         else:
             st.warning("☕ **空手觀望：目前尚無任何一筆資金觸發條件。保單借款利息是你買「從容」的成本，請耐心等待。**")
+    else:
+        st.error("⚠️ 部分股價資料抓取失敗，無法完整顯示面板，請稍後重新整理。")
